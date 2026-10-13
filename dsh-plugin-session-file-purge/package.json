@@ -1,0 +1,59 @@
+{
+  "name": "dsh-plugin-session-file-purge",
+  "version": "0.1.1",
+  "description": "Delete a DeepSeek Harness session together with the files that session produced: a baseline snapshot is taken when the session starts, deletion previews the new/changed files with checkboxes, the selection moves into a trash directory under the harness home, and only then are the session log, projection cache and workspace accounting removed.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "session",
+    "cleanup"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node tools/run-tests.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FJHin/dsh-plugin-session-file-purge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FJHin/dsh-plugin-session-file-purge/issues"
+  },
+  "homepage": "https://github.com/FJHin/dsh-plugin-session-file-purge#readme"
+}

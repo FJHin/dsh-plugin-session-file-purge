@@ -1,0 +1,5 @@
+# dsh-plugin-session-file-purge bundle layer: inserts this plugin's host row.
+# The row id stays stable so profile patches and re-adds can target it.
+- insert:
+    - id: session-file-purge
+      name: 'dsh-plugin-session-file-purge'
