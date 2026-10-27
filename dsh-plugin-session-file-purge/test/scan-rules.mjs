@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { captureBaseline, diffAgainstBaseline, ignoredEntry, normalizeKey, resolveInside, walkFiles } from '../src/scan.js'
+import { captureBaseline, diffAgainstBaseline, ignoredEntry, normalizeKey, resolveInside, staysPut, symlinkHazard, walkFiles } from '../src/scan.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 void here
@@ -97,6 +97,52 @@ check(
   !removed.removed.some((file) => file.path === 'new.txt'),
   `removed=${JSON.stringify(removed.removed)}`,
 )
+
+console.log('\nlinks')
+// A link inside the working directory must not be followed: its target can live
+// anywhere, and a purge that follows it would move content from outside the
+// session's own tree. The walk reports links separately, and the guard refuses a
+// path whose real location is not where its name says.
+check('a plain file stays put', staysPut(path.join(root, 'src', 'keep.txt')) === true)
+check('a path that does not exist yet stays put', staysPut(path.join(root, 'not-there-yet.txt')) === true)
+check('a plain file has no hazard', symlinkHazard(root, 'src/keep.txt') === null)
+check('a missing file has no hazard', symlinkHazard(root, 'gone.txt') === null)
+check('a path outside the root is refused by the hazard check', symlinkHazard(root, '../escape.txt') === 'outside the session directory')
+const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'sespurge-outside-'))
+fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret')
+// A junction is the only link Windows makes without developer mode; Node reports
+// it as a plain directory, so only the real path reveals it.
+let linked = null
+try {
+  fs.symlinkSync(outside, path.join(root, 'linked'), 'junction')
+  linked = 'linked'
+} catch {
+  try {
+    fs.symlinkSync(outside, path.join(root, 'linked'))
+    linked = 'linked'
+  } catch {
+    linked = null
+  }
+}
+if (linked === null) {
+  console.log('  skip link cases: this machine cannot create a symbolic link')
+} else {
+  check('a link is not its own real path', staysPut(path.join(root, linked)) === false)
+  check('the hazard check names the link', symlinkHazard(root, linked) === 'a symbolic link or junction is in the way')
+  check('a file behind the link is refused too', symlinkHazard(root, path.join(linked, 'secret.txt')) === 'a symbolic link or junction is in the way')
+  const used = []
+  const reported = []
+  await walkFiles({
+    root,
+    visit: async (relative) => { used.push(normalizeKey(relative)) },
+    visitLink: async (relative) => { reported.push(normalizeKey(relative)) },
+  })
+  check('the walk reports the link instead of following it', reported.includes(linked), reported.join(','))
+  check('nothing behind the link is walked', !used.some((entry) => entry.startsWith(`${linked}/`)) && !reported.some((entry) => entry.startsWith(`${linked}/`)), used.join(','))
+  const withLink = await diffAgainstBaseline({ baseline, budgetMs: 5000 })
+  check('the diff carries the links it saw', withLink.links.includes(linked), JSON.stringify(withLink.links))
+}
+fs.rmSync(outside, { recursive: true, force: true })
 
 console.log('\nbudget truncation')
 const tiny = await walkFiles({ root, maxEntries: 1, visit: async () => {} })

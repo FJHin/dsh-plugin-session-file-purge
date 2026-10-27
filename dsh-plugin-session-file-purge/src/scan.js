@@ -11,6 +11,12 @@
 // The walk is deliberately bounded and deliberately forgetful: build artifacts
 // and dependency trees are skipped, and a directory too large to scan in the
 // budget reports itself as truncated instead of pretending to be complete.
+//
+// Links are never followed. A symbolic link, and on Windows a junction, keeps its
+// target somewhere else — possibly outside the work directory — so a path that
+// looks like `out/link/report.log` may in truth be `D:\elsewhere\report.log`.
+// The walk reports such entries instead of entering them, and every path that
+// reaches the purge step is checked with realpath before anything moves.
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -73,14 +79,70 @@ export function normalizeKey(relative) {
   return relative.split(path.sep).join('/')
 }
 
+/** Compare two absolute paths the way the platform compares them. */
+function samePath(left, right) {
+  if (left === right) return true
+  return process.platform === 'win32' && left.toLowerCase() === right.toLowerCase()
+}
+
+/**
+ * Resolve a path to where it really is, or null when it cannot be resolved.
+ *
+ * The native resolver is tried first: on Windows the JavaScript one leaves a
+ * junction spelled the way the caller wrote it, which would make a link look
+ * like an ordinary directory. The JavaScript one stays as a fallback for the
+ * places where the native call is unavailable (some network shares).
+ * @param target - the absolute path to resolve.
+ * @returns the real path, or null.
+ */
+function realOrNull(target) {
+  if (typeof fs.realpathSync.native === 'function') {
+    try {
+      return fs.realpathSync.native(target)
+    } catch {
+      // fall through to the portable resolver
+    }
+  }
+  try {
+    return fs.realpathSync(target)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Does this absolute path still live where its own name says it does? Only the
+ * resolved path tells the truth: a link (or a junction) anywhere on the way moves
+ * the answer somewhere else, and "somewhere else" is not the session's directory.
+ * @param absolute - the absolute path to check.
+ * @returns true when the real path equals the lexical one.
+ */
+export function staysPut(absolute) {
+  const real = realOrNull(absolute)
+  // A missing path has no target to follow; the caller reports it as missing.
+  if (real === null) return true
+  return samePath(real, path.resolve(absolute))
+}
+
 /**
  * Walk a directory tree, calling `visit` for every file, and stop when the entry
- * budget or the deadline is hit.
- * @param options - root, optional extra directories to skip, budget and deadline.
+ * budget or the deadline is hit. Links are reported through `visitLink` and never
+ * entered, and a directory that resolves outside `root` (a Windows junction can)
+ * is reported the same way instead of being walked.
+ * @param options - root, extra directories to skip, budget, deadline, visitors.
  * @returns the count of visited files, whether the walk was truncated, and why.
  */
-export async function walkFiles({ root, skipDirs = [], maxEntries = 200_000, deadline = Number.POSITIVE_INFINITY, visit }) {
+export async function walkFiles({ root, skipDirs = [], maxEntries = 200_000, deadline = Number.POSITIVE_INFINITY, visit, visitLink }) {
   const skip = new Set(skipDirs.map((dir) => path.resolve(dir)))
+  const realRoot = realOrNull(root)
+  const insideRoot = (absolute) => {
+    if (realRoot === null) return false
+    const real = realOrNull(absolute)
+    if (real === null) return false
+    if (samePath(real, realRoot)) return true
+    const prefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep
+    return samePath(real.slice(0, Math.min(real.length, prefix.length)), prefix)
+  }
   let visited = 0
   let truncated = false
   let truncationReason = null
@@ -118,16 +180,29 @@ export async function walkFiles({ root, skipDirs = [], maxEntries = 200_000, dea
         if (outOfBudget()) return
         const name = entry.name
         const childRelative = relative === '' ? name : `${relative}${path.sep}${name}`
+        const childAbsolute = path.join(dir, name)
+        if (entry.isSymbolicLink()) {
+          // A link is not a file this session produced, and moving it would either
+          // break the link or, through the copy fallback, smuggle its target here.
+          if (typeof visitLink === 'function') await visitLink(childRelative)
+          continue
+        }
         if (entry.isDirectory()) {
           if (ignoredEntry(name, true)) continue
           if (skip.has(path.resolve(root, childRelative))) continue
-          await step(path.join(dir, name), childRelative)
+          // Windows reports a junction as a directory. Descending would list files
+          // that live outside the session's directory under a path that looks local.
+          if (!insideRoot(childAbsolute)) {
+            if (typeof visitLink === 'function') await visitLink(childRelative)
+            continue
+          }
+          await step(childAbsolute, childRelative)
         } else if (entry.isFile()) {
           if (ignoredEntry(name, false)) continue
           visited += 1
           await visit(childRelative, entry)
         }
-        // symlinks, sockets and devices are left alone
+        // sockets and devices are left alone
       }
     } catch {
       /* iteration interrupted: keep whatever was already visited */
@@ -141,6 +216,8 @@ export async function walkFiles({ root, skipDirs = [], maxEntries = 200_000, dea
 /**
  * Capture a baseline of every file under a root: size and modification time,
  * which is enough to tell new files from changed ones without reading content.
+ * Links are left out on purpose, in both directions, so one never shows up as
+ * added or as removed.
  * @param options - the root, its skip list, and the budget.
  * @returns a snapshot object ready to be serialized next to the session.
  */
@@ -155,10 +232,11 @@ export async function captureBaseline({ root, skipDirs = [], maxEntries = 200_00
     visit: async (relative, entry) => {
       let stat
       try {
-        stat = await fs.promises.stat(path.join(root, relative))
+        stat = await fs.promises.lstat(path.join(root, relative))
       } catch {
         return
       }
+      if (stat.isSymbolicLink() || !stat.isFile()) return
       files[normalizeKey(relative)] = { s: stat.size, m: Math.floor(stat.mtimeMs), d: 0 }
     },
   })
@@ -176,13 +254,14 @@ export async function captureBaseline({ root, skipDirs = [], maxEntries = 200_00
 /**
  * Compare the current directory against a baseline.
  * @param options - the baseline, its skip list and the budget.
- * @returns added, modified and removed relative paths, plus truncation state.
+ * @returns added, modified and removed relative paths, the links seen, plus truncation state.
  */
 export async function diffAgainstBaseline({ baseline, skipDirs = [], maxEntries = 200_000, budgetMs = 20_000 }) {
   const root = baseline.root
   const before = baseline.files || {}
   const added = []
   const modified = []
+  const links = []
   const current = new Set()
   const started = Date.now()
 
@@ -191,16 +270,20 @@ export async function diffAgainstBaseline({ baseline, skipDirs = [], maxEntries 
     skipDirs,
     maxEntries,
     deadline: started + budgetMs,
+    visitLink: async (relative) => {
+      links.push(normalizeKey(relative))
+    },
     visit: async (relative, entry) => {
       const key = normalizeKey(relative)
       current.add(key)
       const previous = before[key]
       let stat
       try {
-        stat = await fs.promises.stat(path.join(root, relative))
+        stat = await fs.promises.lstat(path.join(root, relative))
       } catch {
         return
       }
+      if (stat.isSymbolicLink() || !stat.isFile()) return
       if (previous === undefined) {
         added.push({ path: key, size: stat.size, mtime: Math.floor(stat.mtimeMs) })
         return
@@ -225,6 +308,7 @@ export async function diffAgainstBaseline({ baseline, skipDirs = [], maxEntries 
     added,
     modified,
     removed,
+    links: links.sort(),
     truncated: result.truncated,
     truncationReason: result.truncationReason,
     truncatedByBaseline: baseline.truncated === true,
@@ -252,3 +336,26 @@ export function resolveInside(root, candidate) {
 
 // Removing the folders a purge emptied lives in index.js (`removeEmptiedDirectories`),
 // next to the move it must follow; this module only observes the filesystem.
+
+/**
+ * Refuse a path that is, or passes through, a link. This is the check the purge
+ * step (and a restore destination) runs right before touching the disk, so a
+ * candidate whose real location is outside the session's directory cannot be
+ * moved or written even when its spelling looks local.
+ * @param root - the session's working directory.
+ * @param candidate - a relative path from a plan.
+ * @returns null when the path is safe, otherwise the reason it is refused.
+ */
+export function symlinkHazard(root, candidate) {
+  const absolute = resolveInside(root, candidate)
+  if (absolute === null) return 'outside the session directory'
+  if (!staysPut(absolute)) return 'a symbolic link or junction is in the way'
+  let stat
+  try {
+    stat = fs.lstatSync(absolute)
+  } catch {
+    return null // missing: the caller reports that separately
+  }
+  if (stat.isSymbolicLink()) return 'is a symbolic link'
+  return null
+}

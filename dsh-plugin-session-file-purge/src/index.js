@@ -32,14 +32,21 @@
 // could already drive it, never another origin, another local app, or a bare
 // curl. See admissionStatus() below.
 //
+// A purge moves only what a preview listed: every plan carries a digest of its
+// own file list, /purge and /cleanup must quote it, and a path that was not in
+// that list is refused instead of moved. Links are reported by the scan and never
+// moved, never followed, and a restore never overwrites a file that is already
+// back at the original path — it comes back under a free name beside it.
+//
 // ESM module format (cordis bundle rule): named exports apply/inject/name.
 // Every registration rides the plugin fiber through ctx.effect / the injected
 // context, so disposing the plugin removes its routes, listeners and tools.
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { diagnose } from './diagnostics.js'
-import { captureBaseline, diffAgainstBaseline, resolveInside } from './scan.js'
+import { captureBaseline, diffAgainstBaseline, normalizeKey, resolveInside, symlinkHazard } from './scan.js'
 import { moveToTrash, restoreFile, dropTrashEntry, TrashIndex } from './trash.js'
 
 // Expand the { field: { type, required, description, items } } shorthand into a
@@ -404,16 +411,19 @@ const CHECKED_BY_DEFAULT_LIMIT = 400
 async function planForSession({ sessionId, root, skip, config }) {
   const baseline = readBaseline(sessionId)
   if (baseline === null) {
-    return {
+    const empty = {
       sessionId,
       root,
       baseline: null,
       reason: 'no-baseline',
       added: [],
       modified: [],
+      links: [],
       removedCount: 0,
       truncated: false,
     }
+    empty.planId = planDigest(empty)
+    return empty
   }
 
   const diff = await diffAgainstBaseline({
@@ -450,57 +460,114 @@ async function planForSession({ sessionId, root, skip, config }) {
     for (const file of added.slice(CHECKED_BY_DEFAULT_LIMIT)) file.checked = false
   }
 
-  return {
+  const plan = {
     sessionId,
     root,
     baseline: { capturedAt: baseline.capturedAt, fileCount: baseline.fileCount, truncated: baseline.truncated === true },
     added,
     modified,
+    links: diff.links || [],
     removedCount: diff.removed.length,
     truncated: diff.truncated === true || diff.truncatedByBaseline === true,
     truncationReason: diff.truncationReason,
+  }
+  plan.planId = planDigest(plan)
+  return plan
+}
+
+/**
+ * The identity of one preview: the list of paths the dialog offered, not what the
+ * files contain. A purge must quote this digest, and the digest is recomputed at
+ * purge time, so a list that changed since the dialog opened (a file appeared, a
+ * session was cleaned in another window) is refused instead of acted on.
+ * @param plan - the plan the dialog is showing.
+ * @returns a stable digest for exactly that file list.
+ */
+function planDigest(plan) {
+  const lines = [...(plan.added || []), ...(plan.modified || [])].map((file) => `${file.change}\t${file.path}`).sort()
+  const material = `${plan.sessionId || ''}\n${plan.root || ''}\n${lines.join('\n')}`
+  return `p1-${createHash('sha256').update(material).digest('hex').slice(0, 32)}`
+}
+
+/**
+ * A purge may only act on the preview the user was looking at.
+ * @param plan - the freshly recomputed plan for the session.
+ * @param planId - the digest the client sent back.
+ */
+function assertPlanMatches(plan, planId) {
+  if (typeof planId !== 'string' || planId === '') {
+    throw new PurgeError('planId is required: a purge may only move the files a preview listed', 400)
+  }
+  if (plan.planId !== planId) {
+    throw new PurgeError('the file list changed since that preview; reopen it and choose again', 409)
   }
 }
 
 function planSummary(plan) {
   const total = plan.added.length + plan.modified.length
   const bytes = [...plan.added, ...plan.modified].reduce((sum, file) => sum + (file.size || 0), 0)
-  return { total, added: plan.added.length, modified: plan.modified.length, bytes }
+  return { total, added: plan.added.length, modified: plan.modified.length, links: (plan.links || []).length, bytes }
 }
 
 // --- purge --------------------------------------------------------------------
 
 /**
- * Move the selected files of one session into the trash.
+ * Move the selected files of one session into the trash. Only the files the plan
+ * listed can be moved: the selection is intersected with the preview, so a request
+ * cannot name a path the dialog never offered (an untouched project file, a link,
+ * something outside the working directory).
  * @param options - the session, its root, the selected relative paths, the trash
- * index and the config.
+ * index, the config, and the plan the selection came from.
  * @returns the manifest and a per-path report.
  */
-function purgeSelection({ sessionId, root, paths, index, config, note }) {
+function purgeSelection({ sessionId, root, paths, index, config, note, plan }) {
+  const previewed = new Map()
+  for (const file of [...((plan && plan.added) || []), ...((plan && plan.modified) || [])]) {
+    previewed.set(normalizeKey(file.path), file.change)
+  }
+  const links = new Set(((plan && plan.links) || []).map((link) => normalizeKey(link)))
   const files = []
   const refused = []
   const directories = new Set()
   for (const candidate of paths) {
-    const absolute = resolveInside(root, candidate)
+    const key = normalizeKey(String(candidate || ''))
+    if (links.has(key)) {
+      refused.push({ path: key, error: 'is a symbolic link or junction, which is never moved' })
+      continue
+    }
+    if (!previewed.has(key)) {
+      refused.push({ path: key, error: 'not in the previewed file list' })
+      continue
+    }
+    const absolute = resolveInside(root, key)
     if (absolute === null) {
-      refused.push({ path: candidate, error: 'outside the session directory' })
+      refused.push({ path: key, error: 'outside the session directory' })
+      continue
+    }
+    const hazard = symlinkHazard(root, key)
+    if (hazard !== null) {
+      refused.push({ path: key, error: hazard })
       continue
     }
     let stat
     try {
-      stat = fs.statSync(absolute)
+      stat = fs.lstatSync(absolute)
     } catch {
-      refused.push({ path: candidate, error: 'missing' })
+      refused.push({ path: key, error: 'missing' })
+      continue
+    }
+    if (stat.isSymbolicLink()) {
+      refused.push({ path: key, error: 'is a symbolic link, which is never moved' })
       continue
     }
     if (!stat.isFile()) {
-      refused.push({ path: candidate, error: 'not a file' })
+      refused.push({ path: key, error: 'not a regular file' })
       continue
     }
-    files.push({ absolute, relative: candidate })
-    let parent = path.dirname(candidate)
+    files.push({ absolute, relative: key })
+    let parent = path.dirname(key)
     while (parent !== '.' && parent !== '/' && parent !== '') {
-      directories.add(parent)
+      directories.add(normalizeKey(parent))
       parent = path.dirname(parent)
     }
   }
@@ -540,6 +607,10 @@ function removeEmptiedDirectories(root, directories) {
     const absolute = resolveInside(root, relative)
     if (absolute === null) continue
     try {
+      // A link that happens to sit where a folder used to be is not that folder;
+      // readdir would follow it and rmdir would fail (or, worse, look successful).
+      if (fs.lstatSync(absolute).isSymbolicLink()) continue
+      if (!fs.lstatSync(absolute).isDirectory()) continue
       if (fs.readdirSync(absolute).length !== 0) continue
       fs.rmdirSync(absolute)
       removed.push(relative)
@@ -845,12 +916,14 @@ export function apply(ctx, rawConfig) {
       const paths = Array.isArray(args.paths) ? args.paths.slice(0, config.maxEntries) : []
       if (paths.length === 0) throw new PurgeError('no files were selected', 400)
       const result = await plan(sessionId)
+      assertPlanMatches(result, args.planId)
       const { manifest, refused } = purgeSelection({
         sessionId,
         root: result.root,
         paths,
         index,
         config,
+        plan: result,
         note: typeof args.note === 'string' ? args.note : null,
       })
       return {
@@ -869,12 +942,14 @@ export function apply(ctx, rawConfig) {
       const result = await plan(sessionId)
       let purged = null
       if (paths.length > 0) {
+        assertPlanMatches(result, args.planId)
         const outcome = purgeSelection({
           sessionId,
           root: result.root,
           paths,
           index,
           config,
+          plan: result,
           note: typeof args.note === 'string' ? args.note : null,
         })
         purged = {
@@ -909,16 +984,22 @@ export function apply(ctx, rawConfig) {
         ? manifest.files.filter((file) => args.paths.includes(file.path))
         : manifest.files
       const restored = []
+      const renamed = []
       const failed = []
+      const restoredSources = new Set()
       for (const file of wanted) {
         try {
-          restoreFile(manifest, file.path)
-          restored.push(file.path)
+          // A file already back at the original path is never overwritten: the
+          // trashed copy lands beside it and both names are reported.
+          const outcome = restoreFile(manifest, file.path)
+          restored.push(outcome.relative)
+          if (outcome.renamed) renamed.push({ from: file.path, to: outcome.relative })
+          restoredSources.add(file.path)
         } catch (error) {
           failed.push({ path: file.path, error: String((error && error.message) || error) })
         }
       }
-      const remaining = manifest.files.filter((file) => !restored.includes(file.path))
+      const remaining = manifest.files.filter((file) => !restoredSources.has(file.path))
       if (remaining.length === 0) {
         dropTrashEntry(manifest)
         index.remove(id)
@@ -930,7 +1011,7 @@ export function apply(ctx, rawConfig) {
           /* the index still points at a partially restored entry */
         }
       }
-      return { restored, failed, remaining: remaining.length }
+      return { restored, renamed, failed, remaining: remaining.length }
     })
 
     route('POST', '/__sespurge/trash/drop', async (args) => {
@@ -994,7 +1075,7 @@ export function apply(ctx, rawConfig) {
         defineTool({
           name: 'session_files',
           description:
-            'List or clean up the files one session of this workbench produced. mode "list" reports the files the session created or changed since its baseline snapshot; mode "purge" moves the given paths into the plugin trash directory (never deleting them outright). The harness keeps no per-session file ledger, so the report comes from diffing the working directory against the snapshot taken when the session started.',
+            'List or clean up the files one session of this workbench produced. mode "list" reports the files the session created or changed since its baseline snapshot; mode "purge" moves the given paths into the plugin trash directory (never deleting them outright). Only paths that mode "list" reported for the same session can be moved, and symbolic links are listed but never moved. The harness keeps no per-session file ledger, so the report comes from diffing the working directory against the snapshot taken when the session started.',
           parameters: {
             sessionId: { type: 'string', required: true, description: 'The session id (uuid or session-<uuid>).' },
             mode: { type: 'string', required: false, description: '"list" (default) or "purge".' },
@@ -1024,13 +1105,24 @@ export function apply(ctx, rawConfig) {
               `created: ${summary.added}, changed: ${summary.modified}, ${summary.bytes} bytes`,
             ]
             if (result.truncated) lines.push('warning: the scan hit its budget; the list may be incomplete')
+            if (summary.links > 0) {
+              lines.push(`links: ${summary.links} (symbolic links and junctions are reported, never moved)`)
+            }
             for (const file of result.added.slice(0, 100)) lines.push(`+ ${file.path} (${file.size} bytes)`)
             for (const file of result.modified.slice(0, 100)) lines.push(`~ ${file.path} (${file.size} bytes)`)
             if (mode === 'list') return lines.join('\n')
 
             const paths = Array.isArray(toolArgs.paths) ? toolArgs.paths : []
             if (paths.length === 0) return [...lines, 'purge: no paths were given'].join('\n')
-            const outcome = purgeSelection({ sessionId, root: result.root, paths, index, config, note: 'agent tool' })
+            const outcome = purgeSelection({
+              sessionId,
+              root: result.root,
+              paths,
+              index,
+              config,
+              plan: result,
+              note: 'agent tool',
+            })
             return [
               ...lines,
               `moved into trash: ${outcome.manifest.files.length} (${outcome.manifest.bytes} bytes)`,

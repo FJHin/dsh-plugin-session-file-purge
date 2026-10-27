@@ -141,7 +141,7 @@ for (const source of sources) {
     externalImports.add(specifier)
   }
 }
-const allowed = new Set(['node:fs', 'node:os', 'node:path', 'react', '@deepseek-ai/dsh-client-ui-primitives'])
+const allowed = new Set(['node:crypto', 'node:fs', 'node:os', 'node:path', 'react', '@deepseek-ai/dsh-client-ui-primitives'])
 const unexpected = [...externalImports].filter((specifier) => !allowed.has(specifier))
 check('no unexpected external import appears in the sources', unexpected.length === 0, unexpected.join(', '))
 check('the host half does not import the optional dsh-tools peer at runtime', [...externalImports].every((s) => !s.startsWith('@deepseek-ai/dsh-tools')), [...externalImports].join(', '))

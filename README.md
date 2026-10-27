@@ -97,13 +97,19 @@ dsh plugin --profile <profile> add file:/path/to/dsh-plugin-session-file-purge
 | GET | `/__sespurge/ping` | 探活：返回插件名与宿主 pid |
 | GET | `/__sespurge/session/list` | 会话列表（标题/id/是否运行/是否有基线），供客户端把侧边栏标题对到会话 id |
 | POST | `/__sespurge/plan` | `{sessionId}` → 待清理清单（**只读，不改动任何文件**） |
-| POST | `/__sespurge/purge` | `{sessionId, paths[]}` → 移入回收站，保留会话 |
-| POST | `/__sespurge/cleanup` | `{sessionId, paths[], deleteSession}` → 移入回收站（可选）并删除会话 |
+| POST | `/__sespurge/purge` | `{sessionId, paths[], planId}` → 移入回收站，保留会话 |
+| POST | `/__sespurge/cleanup` | `{sessionId, paths[], planId, deleteSession}` → 移入回收站（可选）并删除会话 |
 | GET | `/__sespurge/trash` | 回收站批次列表 |
 | POST | `/__sespurge/trash/restore` | `{id, paths?}` → 放回指定文件或整批 |
 | POST | `/__sespurge/trash/drop` | `{id}` → 永久删除某一批 |
 
 `sessionId` 必须是 `<uuid>` 或 `session-<uuid>`；`paths` 一律相对工作目录，服务端用 `resolveInside` 校验，`../` 之类的越界路径会被拒绝并计入响应里的 `failed`。
+
+**`plan` 与 `purge`/`cleanup` 之间有绑定**：`plan` 返回的 `planId` 是「清单里的路径 + 变更类型」的摘要（不含大小/时间——内容被正常改写不该让预览失效，但多一个或少一个文件就必须让用户重看）。`purge`/`cleanup` 缺 `planId` 返回 `400`，与当前工作目录算出的摘要不符返回 `409`，并且`paths` 会被**求交**于该清单：预览里没有出现过的路径（项目里没被碰过的文件、被忽略的目录、链接）一律不移动，只在 `failed` 里说明原因。
+
+**符号链接与目录联接**：遍历用真实路径判断目录有没有跑出工作目录（Windows 的 junction 在 `lstat` 里就是普通目录，只有 `realpathSync.native` 能识破），链接本身只**报告**、不跟随、不移动——`rename` 会把链接挪走，而复制兜底会把链接**目标**的内容搬进回收站，两种都不是用户勾选时看到的东西。
+
+**放回不覆盖**：恢复时如果原位置已经有文件，回收站的副本会落在 `name (restored).ext`（必要时 `name (restored 2).ext`…），写入用 `COPYFILE_EXCL`（而不是 `rename`，后者会静默覆盖且在竞态下无法防护），响应里的 `renamed` 会列出改名项，弹窗也会说明。
 
 **每条路由的第一步是准入检查**，而不是读参数：handler 调用 `ctx.get('connection').admit(req)`——就是 `/api` 自己走的那道闸。它先做 Host/Origin 栅栏（Host 必须是回环地址/监听地址/可信主机，Origin 必须同源，`sec-fetch-site: cross-site` 一律拒绝，失败 `403`），再校验浏览器会话（cookie 由进程启动 token 派生、HttpOnly、SameSite=Strict、绑定当前 hostname 与端口、用浏览器无法伪造的密钥签名，缺失或过期 `401`）。组合里没有 `connection` 服务时一律 `503`——**失败关闭，绝不放行**。POST 还必须声明 `content-type: application/json`，否则 `415`，这样跨站表单、`<img>` 探针连"简单请求"都凑不出来。结果：会话标题、文件移动、回收站内容只对"能驱动这个 Web UI 的那个窗口"可见。
 
@@ -124,7 +130,10 @@ profile 行的 `config` 支持这些字段（正整数，缺省用默认值）�
 
 - **身份与来源校验**：所有路由先过宿主的 `connection.admit(req)`（Host/Origin 栅栏 + 启动 token 派生的浏览器会话 cookie），未认证 `401`、跨源 `403`、无 `connection` 服务 `503`；POST 另要求 `application/json`。
 - **只快照、只对比，不改文件**：`plan` 完全只读；只有 `purge`/`cleanup` 才移动文件，且优先 `rename`（跨盘或被占用时退化为复制后删除）。
+- **清理目标就是预览本身**：`purge`/`cleanup` 必须带 `planId`，且只会移动那次 `plan` 列出的路径；清单变了就 `409`，要求用户重看。
 - **越界拦截**：所有来自客户端或模型的路径都过 `resolveInside(root, path)`，解析后必须仍在会话工作目录内。
+- **不跟随链接**：符号链接/junction 只列出、不移动；目录是否仍在工作目录内按**真实路径**判断，链接指向外面时整枝不遍历。
+- **放回不覆盖**：恢复遇到同名文件会改名放回（`name (restored).ext`），绝不覆盖原位置已有的内容。
 - **不碰依赖和版本库**：`node_modules`、`.git`、`.hg`、`.venv`、`__pycache__`、`.next`、`.gradle` 等从不进入快照，也从不出现在清单里。
 - **不静默删除**：任何选中文件先入回收站；`drop` 是唯一真正删除的接口，且只作用于回收站内的批次。
 - **默认勾选保守**：只默认勾选「新建」文件；「改动」文件默认不勾，并在列表里显式提示风险。
@@ -142,6 +151,7 @@ profile 行的 `config` 支持这些字段（正整数，缺省用默认值）�
 - **回收站不会自动过期**，除非下一次清理动作触发保留期检查；也可以手动删 `~/.dsh/session-file-purge/trash` 下的目录。
 - **会话删除链路复用了 `storageDomain` 的 `session_projcache` / `workspace` 表结构**，DSH 大版本升级后需要跟着核对（本版本对 `0.2.0-rc.2` 验证）。
 - 只清理**工作目录内**的文件；会话写到 `/tmp`、其他盘符或家目录别处的文件不在范围内。
+- **符号链接与 junction 只列不搬**：清单会把它们标出来（弹窗另有提示），但插件不会移动链接本身，也不会清理链接目标——那可能根本不在工作目录里。
 
 ### 排障
 
@@ -170,8 +180,8 @@ src/diagnostics.js      启动诊断日志
 src/client.js           客户端 bundle：头部按钮、两步弹窗、回收站面板、侧边栏注入
 test/plugin-contract.mjs  插件契约测试（复刻加载器的 Config / 激活判定）
 test/bundle-install.mjs   bundle 安装契约（包名 / bundles 条目 / patch 行名 / node_modules 目录名必须一致）
-test/scan-rules.mjs       遍历忽略规则、越界校验、基线对比、预算截断
-test/harness.mjs          宿主端行为测试（假 ctx + 假 storageDomain）
+test/scan-rules.mjs       遍历忽略规则、越界校验、链接识别、基线对比、预算截断
+test/harness.mjs          宿主端行为测试（假 ctx + 假 storageDomain，含 planId 绑定与链接拒绝）
 test/client-smoke.mjs     客户端 bundle 冒烟测试（假 React + 假 fetch）
 tools/run-tests.mjs       跑全部测试套件
 tools/verify-live.mjs     对运行中的 harness 做只读验证（ping / 会话列表 / 回收站，可选一次只读 plan）
@@ -239,13 +249,19 @@ The manifest also declares its compatibility window: `engines.dsh: ">=0.2.0-rc.2
 | GET | `/__sespurge/ping` | liveness: plugin name and host pid |
 | GET | `/__sespurge/session/list` | session list (title/id/running/has-baseline) |
 | POST | `/__sespurge/plan` | `{sessionId}` → what a purge would move (read-only) |
-| POST | `/__sespurge/purge` | `{sessionId, paths[]}` → trash the selection, keep the session |
-| POST | `/__sespurge/cleanup` | `{sessionId, paths[], deleteSession}` → trash, then delete |
+| POST | `/__sespurge/purge` | `{sessionId, paths[], planId}` → trash the selection, keep the session |
+| POST | `/__sespurge/cleanup` | `{sessionId, paths[], planId, deleteSession}` → trash, then delete |
 | GET | `/__sespurge/trash` | trash batches |
 | POST | `/__sespurge/trash/restore` | `{id, paths?}` → restore one file or a whole batch |
 | POST | `/__sespurge/trash/drop` | `{id}` → delete a batch for good |
 
 Paths are always relative to the session's working directory and are re-validated with `resolveInside`; anything escaping the root is refused and reported in `failed`.
+
+**A purge is bound to the preview it came from**: `plan` returns a `planId` — a digest of the listed paths and their change kind. Content changes do not invalidate a preview (a file being rewritten mid-conversation is normal), but a different file list must. `purge`/`cleanup` without a `planId` answer `400`, one that no longer matches the working directory answers `409`, and the requested `paths` are intersected with that preview: a path the dialog never offered (an untouched project file, an ignored directory, a link) is never moved and is reported in `failed` with the reason.
+
+**Symbolic links and junctions** are reported, never followed and never moved. Directory containment is decided on real paths (`realpathSync.native` — a Windows junction looks like an ordinary directory to `lstat`), so a link that points outside the working directory is not walked at all. Renaming a link would break it; copying its target would move foreign content into the trash.
+
+**A restore never overwrites**: when the original path is occupied, the trashed copy lands beside it as `name (restored).ext` (`name (restored 2).ext` and so on), written with `COPYFILE_EXCL` rather than `rename` so a race cannot clobber anything; the response lists the renamed entries and the dialog says so.
 
 **Admission comes before the parameters**: every handler first calls `ctx.get('connection').admit(req)`, the gate `/api` itself passes through — a Host/Origin fence (loopback, the bound address or a trusted host; same origin; `sec-fetch-site: cross-site` always refused → `403`) and then the browser session (a launch-token-derived cookie, HttpOnly, SameSite=Strict, bound to this hostname and port, signed with a key the browser cannot mint → `401` when missing or stale). With no `connection` service the route answers `503` and fails closed. A POST must also declare `content-type: application/json` (`415` otherwise), which removes the cross-site "simple request" path entirely. Net effect: session titles, file moves and trash contents are visible only to the window that can already drive this UI.
 
@@ -264,7 +280,10 @@ Paths are always relative to the session's working directory and are re-validate
 
 - Every route is admitted by the harness' `connection.admit(req)` (Host/Origin fence plus the launch-token-derived browser cookie): `401` unauthenticated, `403` from a foreign origin, `503` when no `connection` service exists; POSTs must be `application/json`.
 - `plan` is read-only; only `purge`/`cleanup` move files, and they `rename` (falling back to copy-then-remove across devices).
+- A purge may only move what its own preview listed: `planId` is required (`400`), a stale one is refused (`409`), and unlisted paths are dropped.
 - Every client- or model-supplied path goes through `resolveInside(root, path)`.
+- Links are never followed or moved; containment is decided on real paths.
+- A restore never overwrites: an occupied original path gets a `name (restored).ext` copy instead.
 - `node_modules`, `.git` and build caches never enter a snapshot or a list.
 - Nothing is deleted silently: selected files go to the trash, and `drop` is the only real deletion, scoped to a trash batch.
 - Only *created* files start checked; *changed* files are listed with an explicit warning.
@@ -282,6 +301,7 @@ Paths are always relative to the session's working directory and are re-validate
 - The trash does not expire on its own except through the retention check on the next purge.
 - The session-deletion chain relies on the `session_projcache` / `workspace` storage tables and needs re-checking after a major DSH upgrade (verified against `0.2.0-rc.2`).
 - Only files inside the working directory are considered.
+- Symbolic links and junctions are listed but never moved, and their targets are never cleaned up — the target may not live inside the working directory at all.
 
 ### Troubleshooting
 

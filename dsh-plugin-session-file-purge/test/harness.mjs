@@ -225,7 +225,7 @@ check('changed files start unchecked', plan.modified.every((file) => file.checke
 
 console.log('\npurge into the trash')
 const purged = await callRoute(routes, '/__sespurge/purge', {
-  body: { sessionId, paths: ['report.docx', 'out/chart.png', '../escape.txt'] },
+  body: { sessionId, paths: ['report.docx', 'out/chart.png', '../escape.txt'], planId: plan.planId },
 })
 check('purge route answers ok', purged.status === 200 && purged.payload.ok === true, JSON.stringify(purged.payload))
 const purgeValue = purged.payload.value
@@ -243,8 +243,9 @@ check('restore answers ok', restored.payload.ok === true, JSON.stringify(restore
 check('file is back', fs.existsSync(path.join(workspace, 'report.docx')) && fs.existsSync(path.join(workspace, 'out', 'chart.png')))
 
 console.log('\ncleanup: purge and delete the session')
+const beforeCleanup = await callRoute(routes, '/__sespurge/plan', { body: { sessionId } })
 const cleanup = await callRoute(routes, '/__sespurge/cleanup', {
-  body: { sessionId, paths: ['report.docx', 'out/chart.png'], deleteSession: true },
+  body: { sessionId, paths: ['report.docx', 'out/chart.png'], planId: beforeCleanup.payload.value.planId, deleteSession: true },
 })
 check('cleanup answers ok', cleanup.payload.ok === true, JSON.stringify(cleanup.payload))
 const cleanupValue = cleanup.payload.value
@@ -256,15 +257,20 @@ check('baseline forgotten', !fs.existsSync(baselineFile))
 
 console.log('\nrestore a selected subset')
 // A fresh session cycle: the same id, a new baseline (the previous one was
-// forgotten with the session), so the two new files register as created.
+// forgotten with the session). The two files appear after the snapshot, so the
+// preview lists them as created and the purge is allowed to name them.
 fs.mkdirSync(path.join(home, 'sessions', '--tmp--', sessionId), { recursive: true })
 fs.writeFileSync(path.join(home, 'sessions', '--tmp--', sessionId, 'session.v4.jsonl.zstd'), 'log')
 context.emit('session/disposed', session)
-fs.writeFileSync(path.join(workspace, 'a.txt'), 'a')
-fs.writeFileSync(path.join(workspace, 'b.txt'), 'b')
 context.emit('session/event', session, { type: 'turn/start', data: { turn: 2 } })
 await new Promise((resolve) => setTimeout(resolve, 400))
-const second = await callRoute(routes, '/__sespurge/purge', { body: { sessionId, paths: ['a.txt', 'b.txt'] } })
+fs.writeFileSync(path.join(workspace, 'a.txt'), 'a')
+fs.writeFileSync(path.join(workspace, 'b.txt'), 'b')
+const secondPlan = await callRoute(routes, '/__sespurge/plan', { body: { sessionId } })
+check('the second preview lists both files', secondPlan.payload.value.added.length === 2, JSON.stringify(secondPlan.payload.value.added))
+const second = await callRoute(routes, '/__sespurge/purge', {
+  body: { sessionId, paths: ['a.txt', 'b.txt'], planId: secondPlan.payload.value.planId },
+})
 check('the new cycle purges both files', second.payload.ok === true && second.payload.value.moved.length === 2, JSON.stringify(second.payload))
 const secondId = second.payload.value.trashId
 const partial = await callRoute(routes, '/__sespurge/trash/restore', { body: { id: secondId, paths: ['a.txt'] } })
@@ -330,6 +336,58 @@ if (tools[0]) {
   check('tool purges a named path', /moved into trash: 1/.test(purgedByTool), purgedByTool)
   check('tool purge moved the file', !fs.existsSync(path.join(workspace, 'a.txt')))
 }
+
+console.log('\nplan bound selection')
+// A third cycle for the same session. The preview digest binds a purge to the
+// file list the user actually saw, and any link in the working tree is reported
+// but never moved: renaming a link would break it, and copying its target would
+// pull outside content into the trash.
+fs.mkdirSync(path.join(home, 'sessions', '--tmp--', sessionId), { recursive: true })
+fs.writeFileSync(path.join(home, 'sessions', '--tmp--', sessionId, 'session.v4.jsonl.zstd'), 'log')
+context.emit('session/disposed', session)
+context.emit('session/event', session, { type: 'turn/start', data: { turn: 3 } })
+await new Promise((resolve) => setTimeout(resolve, 400))
+const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sespurge-outside-'))
+fs.writeFileSync(path.join(outsideDir, 'outside.txt'), 'outside')
+fs.writeFileSync(path.join(workspace, 'c.txt'), 'c')
+// A junction is the one link a Windows machine without developer mode can make,
+// and Node reports it as an ordinary directory, so only real paths tell it apart.
+fs.symlinkSync(outsideDir, path.join(workspace, 'linked'), 'junction')
+const thirdPlan = await callRoute(routes, '/__sespurge/plan', { body: { sessionId } })
+const third = thirdPlan.payload.value
+check('the preview carries a plan id', typeof third.planId === 'string' && /^p1-[0-9a-f]{32}$/.test(third.planId), JSON.stringify(third.planId))
+check('the preview lists the new file', third.added.some((file) => file.path === 'c.txt'), JSON.stringify(third.added.map((file) => file.path)))
+check('the preview reports the junction', third.links.includes('linked'), JSON.stringify(third.links))
+const listedWithLink = await tools[0].execute({ sessionId, mode: 'list' })
+check('the tool list reports the junction', /links: 1 \(symbolic links and junctions are reported, never moved\)/.test(listedWithLink), listedWithLink)
+const stalePlan = await callRoute(routes, '/__sespurge/purge', {
+  body: { sessionId, paths: ['c.txt'], planId: 'p1-00000000000000000000000000000000' },
+})
+check('a purge whose preview no longer matches is refused', stalePlan.status === 409, JSON.stringify(stalePlan))
+const missingPlan = await callRoute(routes, '/__sespurge/purge', { body: { sessionId, paths: ['c.txt'] } })
+check('a purge without a plan id is refused', missingPlan.status === 400, JSON.stringify(missingPlan))
+const unpicked = await callRoute(routes, '/__sespurge/purge', {
+  body: { sessionId, paths: ['node_modules/ignored/package.json'], planId: third.planId },
+})
+check('a file the preview never offered is refused', unpicked.payload.value.moved.length === 0 &&
+  unpicked.payload.value.failed.some((entry) => entry.error === 'not in the previewed file list'), JSON.stringify(unpicked.payload.value))
+check('the refused file is still in place', fs.existsSync(path.join(workspace, 'node_modules', 'ignored', 'package.json')))
+const linked = await callRoute(routes, '/__sespurge/purge', { body: { sessionId, paths: ['linked'], planId: third.planId } })
+check('a junction is refused', linked.payload.value.moved.length === 0 &&
+  linked.payload.value.failed.some((entry) => /symbolic link or junction/.test(entry.error)), JSON.stringify(linked.payload.value))
+check('the junction still points outside', fs.existsSync(path.join(workspace, 'linked', 'outside.txt')))
+const movedC = await callRoute(routes, '/__sespurge/purge', { body: { sessionId, paths: ['c.txt'], planId: third.planId } })
+check('the previewed file still moves', movedC.payload.value.moved.length === 1, JSON.stringify(movedC.payload.value))
+
+console.log('\nrestore never overwrites')
+fs.writeFileSync(path.join(workspace, 'c.txt'), 'newer')
+const keptRestore = await callRoute(routes, '/__sespurge/trash/restore', { body: { id: movedC.payload.value.trashId } })
+check('the restore answers ok', keptRestore.payload.ok === true, JSON.stringify(keptRestore.payload))
+const restoreValue = keptRestore.payload.value
+check('the restored file is reported under a new name',
+  restoreValue.renamed.length === 1 && restoreValue.renamed[0].to === 'c (restored).txt', JSON.stringify(restoreValue.renamed))
+check('the file already in place is untouched', fs.readFileSync(path.join(workspace, 'c.txt'), 'utf8') === 'newer')
+check('the trashed copy came back beside it', fs.readFileSync(path.join(workspace, 'c (restored).txt'), 'utf8') === 'c')
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) process.exitCode = 1

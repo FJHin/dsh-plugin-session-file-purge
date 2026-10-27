@@ -85,6 +85,8 @@ window.__ModuleLoader__.load({
       'dialog.doneFailed': '{n} 个文件未能移动',
       'dialog.restore': '撤销：把文件放回去',
       'dialog.restored': '已放回 {n} 个文件',
+      'dialog.restoredRenamed': '为避免覆盖，{n} 个文件以新名称放回（原名处已有文件）。',
+      'dialog.linksNote': '{n} 个符号链接/目录联接被跳过：插件只会列出并移动真实文件，不会跟随或移动链接。',
       'dialog.openTrash': '打开回收站',
       'dialog.close': '关闭',
       'trash.title': '文件回收站',
@@ -144,6 +146,8 @@ window.__ModuleLoader__.load({
       'dialog.doneFailed': '{n} files could not be moved',
       'dialog.restore': 'Undo: put the files back',
       'dialog.restored': 'Put {n} files back',
+      'dialog.restoredRenamed': 'To avoid overwriting, {n} files went back under a new name (the original path was taken).',
+      'dialog.linksNote': '{n} symbolic links/junctions were skipped: only real files are listed and moved, links are never followed or moved.',
       'dialog.openTrash': 'Open trash',
       'dialog.close': 'Close',
       'trash.title': 'File trash',
@@ -482,6 +486,9 @@ window.__ModuleLoader__.load({
           const result = await postJson('/__sespurge/cleanup', {
             sessionId: target.sessionId,
             paths: selectionList,
+            // The digest of the preview the user is looking at: the host refuses a
+            // selection whose list no longer matches, and a path that was not in it.
+            planId: plan && plan.planId,
             deleteSession,
           })
           setOutcome({ ...result, deleteSession })
@@ -493,7 +500,7 @@ window.__ModuleLoader__.load({
           setBusy(false)
           setBusyLabel(null)
         }
-      }, [target, busy, selectionList])
+      }, [target, busy, selectionList, plan])
 
       const restoreOutcome = useCallback(async () => {
         const trashId = outcome && outcome.purged && outcome.purged.trashId
@@ -600,6 +607,9 @@ window.__ModuleLoader__.load({
           body.push(fileGroups())
           if (plan.truncated) body.push(React.createElement('div', { key: 'trunc', style: warnStyle }, t('dialog.truncated')))
         }
+        if (plan.links && plan.links.length > 0) {
+          body.push(React.createElement('div', { key: 'links', style: metaStyle }, t('dialog.linksNote', { n: plan.links.length })))
+        }
         if (plan.removedCount > 0) {
           body.push(React.createElement('div', { key: 'removed', style: metaStyle }, t('dialog.removedNote', { n: plan.removedCount })))
         }
@@ -630,6 +640,9 @@ window.__ModuleLoader__.load({
         }
         if (outcome.restored) {
           body.push(React.createElement('div', { key: 'restored', style: metaStyle }, t('dialog.restored', { n: outcome.restored.restored.length })))
+          if (outcome.restored.renamed && outcome.restored.renamed.length > 0) {
+            body.push(React.createElement('div', { key: 'restored-renamed', style: metaStyle }, t('dialog.restoredRenamed', { n: outcome.restored.renamed.length })))
+          }
         }
         if (error) body.push(React.createElement('div', { key: 'err2', role: 'alert', style: errStyle }, error))
       }

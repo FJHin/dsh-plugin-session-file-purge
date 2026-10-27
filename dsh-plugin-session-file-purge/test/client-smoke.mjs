@@ -183,8 +183,10 @@ globalThis.fetch = async (url, options) => {
       modified: [
         { path: 'src/existing.txt', absolute: 'D:/work/demo/src/existing.txt', size: 120, mtime: 3, previousSize: 6, change: 'modified', checked: false },
       ],
+      links: ['linked'],
       removedCount: 1,
       truncated: false,
+      planId: 'p1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     } }) }
   }
   if (url === '/__sespurge/cleanup') {
@@ -199,7 +201,7 @@ globalThis.fetch = async (url, options) => {
     ] } }) }
   }
   if (url === '/__sespurge/trash/restore') {
-    return { ok: true, status: 200, json: async () => ({ ok: true, value: { restored: ['report.docx'], failed: [], remaining: 0 } }) }
+    return { ok: true, status: 200, json: async () => ({ ok: true, value: { restored: ['report.docx'], renamed: [], failed: [], remaining: 0 } }) }
   }
   return { ok: false, status: 404, json: async () => ({ error: 'not found' }) }
 }
@@ -285,8 +287,10 @@ const plan = {
   modified: [
     { path: 'src/existing.txt', absolute: 'D:/work/demo/src/existing.txt', size: 120, mtime: 3, previousSize: 6, change: 'modified', checked: false },
   ],
+  links: ['linked'],
   removedCount: 1,
   truncated: false,
+  planId: 'p1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
 }
 const selected = new Set(['report.docx', 'out/chart.png'])
 const outcome = {
@@ -354,6 +358,7 @@ check('file rows render', fileLabels.length === 4, `got ${fileLabels.length}`) /
 check('created files start checked and changed ones do not', JSON.stringify(checkboxesOf(files)) === JSON.stringify([true, true, false]), JSON.stringify(checkboxesOf(files)))
 check('the file list shows the modified warning', JSON.stringify(files.element).includes('dialog.modifiedWarn'))
 check('the file list reports the removed-file count', JSON.stringify(files.element).includes('dialog.removedNote'))
+check('the file list mentions the skipped links', JSON.stringify(files.element).includes('dialog.linksNote'))
 
 // Pressing the delete button sends the checked paths and asks for the session.
 const fileButtons = buttonsOf(files)
@@ -363,6 +368,7 @@ await new Promise((resolve) => setImmediate(resolve))
 const cleanupRequest = requests.find((request) => request.url === '/__sespurge/cleanup')
 check('cleanup carries the checked paths', cleanupRequest !== undefined && JSON.stringify(cleanupRequest.body.paths) === JSON.stringify(['report.docx', 'out/chart.png']), JSON.stringify(cleanupRequest && cleanupRequest.body))
 check('cleanup asks to delete the session', cleanupRequest !== undefined && cleanupRequest.body.deleteSession === true)
+check('cleanup carries the preview id', cleanupRequest !== undefined && cleanupRequest.body.planId === 'p1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', JSON.stringify(cleanupRequest && cleanupRequest.body))
 
 // Pressing the keep-session button purges without deleting.
 requests.length = 0

@@ -5,8 +5,18 @@
 // mistaken selection can be undone from the UI (or by hand) later. The manifest
 // records the session's workspace root, which is what makes a restore possible
 // even after the session itself is gone.
+//
+// Two rules here are not negotiable. A link is never moved: the trash would then
+// hold a copy of whatever the link pointed at instead of the link. And a restore
+// never overwrites: when something already sits at the original path, the file
+// comes back under a free name beside it and the caller reports both names.
 import fs from 'node:fs'
 import path from 'node:path'
+
+import { symlinkHazard } from './scan.js'
+
+/** How many alternative names a restore may try before giving up. */
+const RESTORE_NAME_ATTEMPTS = 200
 
 /** Format a timestamp as `YYYYMMDD-HHmmss`, used as a trash directory name. */
 function stamp(date = new Date()) {
@@ -100,6 +110,53 @@ export class TrashIndex {
   }
 }
 
+/** Does anything (a file, a directory, a link) already sit at this path? */
+function occupied(target) {
+  try {
+    fs.lstatSync(target)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** A trash directory name that is not taken yet. */
+function freshEntryId(trashRoot, sessionId) {
+  const base = `${stamp()}-${shortId(sessionId)}`
+  if (!occupied(path.join(trashRoot, base))) return base
+  for (let n = 2; n < RESTORE_NAME_ATTEMPTS; n += 1) {
+    const candidate = `${base}-${n}`
+    if (!occupied(path.join(trashRoot, candidate))) return candidate
+  }
+  return `${base}-${Date.now()}`
+}
+
+/**
+ * Turn `report.docx` into `report (restored).docx` and, if that is taken too,
+ * `report (restored 2).docx` … so a restore never lands on top of something.
+ * @param root - the workspace the file came from.
+ * @param relative - its original relative path.
+ * @returns the free destination, or null when every candidate is taken.
+ */
+function freeRestorePath(root, relative) {
+  const absolute = path.join(root, relative)
+  if (!occupied(absolute)) return { absolute, relative, renamed: false }
+  const directory = path.dirname(relative)
+  const base = path.basename(relative)
+  const extension = path.extname(base)
+  const stem = extension === '' ? base : base.slice(0, -extension.length)
+  for (let n = 1; n < RESTORE_NAME_ATTEMPTS; n += 1) {
+    const suffix = n === 1 ? ' (restored)' : ` (restored ${n})`
+    const name = `${stem}${suffix}${extension}`
+    const candidate = directory === '.' || directory === '' ? name : path.join(directory, name)
+    const candidateAbsolute = path.join(root, candidate)
+    if (!occupied(candidateAbsolute)) {
+      return { absolute: candidateAbsolute, relative: candidate.split(path.sep).join('/'), renamed: true }
+    }
+  }
+  return null
+}
+
 /**
  * Move a list of absolute files into the trash, preserving their path relative
  * to the workspace root.
@@ -107,7 +164,7 @@ export class TrashIndex {
  * @returns the manifest written for this purge.
  */
 export function moveToTrash({ trashRoot, sessionId, root, files, directories = [], note = null }) {
-  const id = `${stamp()}-${shortId(sessionId)}`
+  const id = freshEntryId(trashRoot, sessionId)
   const dir = path.join(trashRoot, id)
   const payloadRoot = path.join(dir, 'files')
   fs.mkdirSync(payloadRoot, { recursive: true })
@@ -120,9 +177,26 @@ export function moveToTrash({ trashRoot, sessionId, root, files, directories = [
     const absolute = file.absolute
     const relative = file.relative
     const destination = path.join(payloadRoot, relative)
+    let stat
+    try {
+      // lstat, not stat: what matters is the entry itself, never what it links to.
+      stat = fs.lstatSync(absolute)
+    } catch (error) {
+      failed.push({ path: relative, error: String((error && error.message) || error) })
+      continue
+    }
+    if (stat.isSymbolicLink()) {
+      // Moving a link would break it; copying it would drag its target into the
+      // trash. Neither is what the dialog promised, so the link stays where it is.
+      failed.push({ path: relative, error: 'refusing to move a symbolic link' })
+      continue
+    }
+    if (!stat.isFile()) {
+      failed.push({ path: relative, error: 'not a regular file' })
+      continue
+    }
     try {
       fs.mkdirSync(path.dirname(destination), { recursive: true })
-      const stat = fs.statSync(absolute)
       fs.renameSync(absolute, destination)
       moved.push({ path: relative, bytes: stat.size })
       bytes += stat.size
@@ -130,12 +204,13 @@ export function moveToTrash({ trashRoot, sessionId, root, files, directories = [
       // A cross-device or locked file is copied instead of moved; when even that
       // fails the file stays where it is and is reported rather than lost.
       try {
-        const stat = fs.statSync(absolute)
+        const again = fs.lstatSync(absolute)
+        if (again.isSymbolicLink() || !again.isFile()) throw error
         fs.mkdirSync(path.dirname(destination), { recursive: true })
         fs.copyFileSync(absolute, destination)
         fs.rmSync(absolute, { force: true })
-        moved.push({ path: relative, bytes: stat.size })
-        bytes += stat.size
+        moved.push({ path: relative, bytes: again.size })
+        bytes += again.size
       } catch (copyError) {
         failed.push({ path: relative, error: String((copyError && copyError.message) || copyError) })
       }
@@ -146,6 +221,7 @@ export function moveToTrash({ trashRoot, sessionId, root, files, directories = [
   for (const relative of directories) {
     const absolute = path.join(root, relative)
     try {
+      if (fs.lstatSync(absolute).isSymbolicLink()) continue
       if (fs.readdirSync(absolute).length === 0) {
         fs.rmdirSync(absolute)
         emptied.push(relative)
@@ -173,22 +249,51 @@ export function moveToTrash({ trashRoot, sessionId, root, files, directories = [
 }
 
 /**
- * Put a trashed file back where it came from.
+ * Put a trashed file back where it came from — beside it if the original path is
+ * taken, never on top of whatever is there now.
  * @param manifest - the manifest of the trash entry.
  * @param relative - the file's path relative to the manifest's root.
- * @returns where it was restored to.
+ * @returns the relative path it landed on, the absolute path, and whether it was renamed.
  */
 export function restoreFile(manifest, relative) {
+  const hazard = symlinkHazard(manifest.root, relative)
+  if (hazard !== null) throw new Error(`the original location refuses a restore: ${hazard}`)
+
   const source = path.join(manifest.dir, 'files', relative)
-  const destination = path.join(manifest.root, relative)
-  fs.mkdirSync(path.dirname(destination), { recursive: true })
+  let sourceStat
   try {
-    fs.renameSync(source, destination)
+    sourceStat = fs.lstatSync(source)
   } catch {
-    fs.copyFileSync(source, destination)
-    fs.rmSync(source, { force: true })
+    throw new Error('the trashed copy is missing')
   }
-  return destination
+  if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) throw new Error('the trashed copy is not a regular file')
+
+  let target = null
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    target = freeRestorePath(manifest.root, relative)
+    if (target === null) throw new Error('no free name is available beside the original path')
+    try {
+      fs.mkdirSync(path.dirname(target.absolute), { recursive: true })
+      // COPYFILE_EXCL turns a race with another writer into an error rather than
+      // an overwrite: a restore must never replace a file the user already has.
+      fs.copyFileSync(source, target.absolute, fs.constants.COPYFILE_EXCL)
+      break
+    } catch (error) {
+      if (error && error.code === 'EEXIST' && attempt < 4) {
+        target = null
+        continue
+      }
+      throw error
+    }
+  }
+  if (target === null) throw new Error('the file could not be restored')
+  try {
+    fs.utimesSync(target.absolute, sourceStat.atime, sourceStat.mtime)
+  } catch {
+    /* the timestamps are a courtesy, not the promise */
+  }
+  fs.rmSync(source, { force: true })
+  return { relative: target.relative, absolute: target.absolute, renamed: target.renamed }
 }
 
 /**
