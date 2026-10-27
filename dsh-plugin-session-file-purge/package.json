@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-session-file-purge",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Delete a DeepSeek Harness session together with the files that session produced: a baseline snapshot is taken when the session starts, deletion previews the new/changed files with checkboxes, the selection moves into a trash directory under the harness home, and only then are the session log, projection cache and workspace accounting removed.",
   "type": "module",
   "license": "MIT",

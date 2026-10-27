@@ -1,4 +1,5 @@
 [README.md](https://github.com/user-attachments/files/33392459/README.md)
+
 # dsh-plugin-session-file-purge
 
 **Delete a DeepSeek Harness session *and* the files that session produced.**
@@ -109,7 +110,9 @@ dsh plugin --profile <profile> add file:/path/to/dsh-plugin-session-file-purge
 
 **符号链接与目录联接**：遍历用真实路径判断目录有没有跑出工作目录（Windows 的 junction 在 `lstat` 里就是普通目录，只有 `realpathSync.native` 能识破），链接本身只**报告**、不跟随、不移动——`rename` 会把链接挪走，而复制兜底会把链接**目标**的内容搬进回收站，两种都不是用户勾选时看到的东西。
 
-**放回不覆盖**：恢复时如果原位置已经有文件，回收站的副本会落在 `name (restored).ext`（必要时 `name (restored 2).ext`…），写入用 `COPYFILE_EXCL`（而不是 `rename`，后者会静默覆盖且在竞态下无法防护），响应里的 `renamed` 会列出改名项，弹窗也会说明。
+**父目录也算数**：核对的不只是文件本身，而是从工作目录一路下去**每一级父目录**。恢复时这条尤其重要——文件本身早就不在了，`realpath` 无从解析，只有一个变了链接的父目录能暴露真实去向；不查父目录，「把报告放回去」就会变成「写进别人的文件夹」。补上父目录校验后这种恢复会直接拒绝（原因写在 `failed` 里），并且 `mkdir -p` 之后还会再核一次真实路径，防止检查与写入之间被换掉。
+
+**放回不覆盖**：恢复时如果原位置已经有文件，回收站的副本会落在 `name (restored).ext`（必要时 `name (restored 2).ext`…），写入用 `COPYFILE_EXCL`（而不是 `rename`，后者会静默覆盖且在竞态下无法防护），响应里的 `renamed` 会列出改名项，弹窗也会说明。如果原位置的**父目录**已经被换成链接，恢复不会「顺着」写过去，而是拒绝并报 `refuses a restore`。
 
 **每条路由的第一步是准入检查**，而不是读参数：handler 调用 `ctx.get('connection').admit(req)`——就是 `/api` 自己走的那道闸。它先做 Host/Origin 栅栏（Host 必须是回环地址/监听地址/可信主机，Origin 必须同源，`sec-fetch-site: cross-site` 一律拒绝，失败 `403`），再校验浏览器会话（cookie 由进程启动 token 派生、HttpOnly、SameSite=Strict、绑定当前 hostname 与端口、用浏览器无法伪造的密钥签名，缺失或过期 `401`）。组合里没有 `connection` 服务时一律 `503`——**失败关闭，绝不放行**。POST 还必须声明 `content-type: application/json`，否则 `415`，这样跨站表单、`<img>` 探针连"简单请求"都凑不出来。结果：会话标题、文件移动、回收站内容只对"能驱动这个 Web UI 的那个窗口"可见。
 
@@ -132,7 +135,7 @@ profile 行的 `config` 支持这些字段（正整数，缺省用默认值）�
 - **只快照、只对比，不改文件**：`plan` 完全只读；只有 `purge`/`cleanup` 才移动文件，且优先 `rename`（跨盘或被占用时退化为复制后删除）。
 - **清理目标就是预览本身**：`purge`/`cleanup` 必须带 `planId`，且只会移动那次 `plan` 列出的路径；清单变了就 `409`，要求用户重看。
 - **越界拦截**：所有来自客户端或模型的路径都过 `resolveInside(root, path)`，解析后必须仍在会话工作目录内。
-- **不跟随链接**：符号链接/junction 只列出、不移动；目录是否仍在工作目录内按**真实路径**判断，链接指向外面时整枝不遍历。
+- **不跟随链接**：符号链接/junction 只列出、不移动；目录是否仍在工作目录内按**真实路径**判断（含每一级父目录），链接指向外面时整枝不遍历。
 - **放回不覆盖**：恢复遇到同名文件会改名放回（`name (restored).ext`），绝不覆盖原位置已有的内容。
 - **不碰依赖和版本库**：`node_modules`、`.git`、`.hg`、`.venv`、`__pycache__`、`.next`、`.gradle` 等从不进入快照，也从不出现在清单里。
 - **不静默删除**：任何选中文件先入回收站；`drop` 是唯一真正删除的接口，且只作用于回收站内的批次。
@@ -261,7 +264,9 @@ Paths are always relative to the session's working directory and are re-validate
 
 **Symbolic links and junctions** are reported, never followed and never moved. Directory containment is decided on real paths (`realpathSync.native` — a Windows junction looks like an ordinary directory to `lstat`), so a link that points outside the working directory is not walked at all. Renaming a link would break it; copying its target would move foreign content into the trash.
 
-**A restore never overwrites**: when the original path is occupied, the trashed copy lands beside it as `name (restored).ext` (`name (restored 2).ext` and so on), written with `COPYFILE_EXCL` rather than `rename` so a race cannot clobber anything; the response lists the renamed entries and the dialog says so.
+**Parents count too.** The check walks every directory between the working directory and the file, not just the file itself. That is what a restore needs: the file is gone, so it has no real path of its own, and only a parent that has since become a link reveals where the write would really land. Without it, "put my report back" can mean "write into somebody else's folder". Such a restore is refused and the reason is reported in `failed`; the real path is checked once more after `mkdir -p`, so a swap between check and write is caught too.
+
+**A restore never overwrites**: when the original path is occupied, the trashed copy lands beside it as `name (restored).ext` (`name (restored 2).ext` and so on), written with `COPYFILE_EXCL` rather than `rename` so a race cannot clobber anything; the response lists the renamed entries and the dialog says so. When the original *parent directory* has become a link, the restore refuses (`refuses a restore`) instead of writing through it.
 
 **Admission comes before the parameters**: every handler first calls `ctx.get('connection').admit(req)`, the gate `/api` itself passes through — a Host/Origin fence (loopback, the bound address or a trusted host; same origin; `sec-fetch-site: cross-site` always refused → `403`) and then the browser session (a launch-token-derived cookie, HttpOnly, SameSite=Strict, bound to this hostname and port, signed with a key the browser cannot mint → `401` when missing or stale). With no `connection` service the route answers `503` and fails closed. A POST must also declare `content-type: application/json` (`415` otherwise), which removes the cross-site "simple request" path entirely. Net effect: session titles, file moves and trash contents are visible only to the window that can already drive this UI.
 
@@ -282,7 +287,7 @@ Paths are always relative to the session's working directory and are re-validate
 - `plan` is read-only; only `purge`/`cleanup` move files, and they `rename` (falling back to copy-then-remove across devices).
 - A purge may only move what its own preview listed: `planId` is required (`400`), a stale one is refused (`409`), and unlisted paths are dropped.
 - Every client- or model-supplied path goes through `resolveInside(root, path)`.
-- Links are never followed or moved; containment is decided on real paths.
+- Links are never followed or moved; containment is decided on real paths, for every parent directory as well as the file itself.
 - A restore never overwrites: an occupied original path gets a `name (restored).ext` copy instead.
 - `node_modules`, `.git` and build caches never enter a snapshot or a list.
 - Nothing is deleted silently: selected files go to the trash, and `drop` is the only real deletion, scoped to a trash batch.

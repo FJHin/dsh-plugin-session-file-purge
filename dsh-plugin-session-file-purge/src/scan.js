@@ -17,6 +17,12 @@
 // looks like `out/link/report.log` may in truth be `D:\elsewhere\report.log`.
 // The walk reports such entries instead of entering them, and every path that
 // reaches the purge step is checked with realpath before anything moves.
+//
+// That check covers the *whole* path, not just the leaf: a file that does not exist
+// yet (the restore case) has no realpath of its own, so a link sitting where one of
+// its parent directories used to be would go unnoticed and the write would land on
+// the link's target. Every ancestor is therefore resolved and compared against the
+// root before a purge moves or a restore writes.
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -86,6 +92,66 @@ function samePath(left, right) {
 }
 
 /**
+ * Is `real` the root itself or something below it? Both sides must already be
+ * real paths; this only compares them.
+ * @param real - a resolved path.
+ * @param realRoot - the resolved root.
+ */
+function withinRoot(real, realRoot) {
+  if (samePath(real, realRoot)) return true
+  const prefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep
+  return real.startsWith(prefix) || (process.platform === 'win32' && real.toLowerCase().startsWith(prefix.toLowerCase()))
+}
+
+/**
+ * Check every directory between the root and the candidate's own directory.
+ *
+ * This exists for the paths that do not exist yet: `realpath` on a missing path
+ * fails, so `staysPut` says "fine" and a restore would happily write through a
+ * parent that has since become a link. Walking the chain catches that case — a
+ * parent that is a link, or that resolves outside the root, is refused.
+ * @param root - the session's working directory.
+ * @param absolute - the absolute candidate path.
+ * @returns null when every existing ancestor is a real directory inside the root.
+ */
+function ancestorHazard(root, absolute) {
+  const rootResolved = path.resolve(root)
+  const realRoot = realOrNull(rootResolved)
+  const relative = path.relative(rootResolved, path.dirname(absolute))
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return 'outside the session directory'
+  const segments = relative === '' ? [] : relative.split(path.sep)
+  let current = rootResolved
+  for (const segment of segments) {
+    current = path.join(current, segment)
+    let stat
+    try {
+      stat = fs.lstatSync(current)
+    } catch {
+      // Missing: the caller creates the remaining directories, which are real.
+      return null
+    }
+    if (stat.isSymbolicLink()) return 'a symbolic link or junction is in the way'
+    if (!stat.isDirectory()) return 'a parent of this path is not a directory'
+    if (realRoot === null) return 'outside the session directory'
+    const real = realOrNull(current)
+    if (real === null || !withinRoot(real, realRoot)) return 'a symbolic link or junction is in the way'
+  }
+  return null
+}
+
+/**
+ * The public form of the ancestor check, for callers that hold a relative path.
+ * @param root - the session's working directory.
+ * @param candidate - a relative path from a plan.
+ * @returns null when the path's parents are safe, otherwise the reason it is refused.
+ */
+export function parentHazard(root, candidate) {
+  const absolute = resolveInside(root, candidate)
+  if (absolute === null) return 'outside the session directory'
+  return ancestorHazard(root, absolute)
+}
+
+/**
  * Resolve a path to where it really is, or null when it cannot be resolved.
  *
  * The native resolver is tried first: on Windows the JavaScript one leaves a
@@ -139,9 +205,7 @@ export async function walkFiles({ root, skipDirs = [], maxEntries = 200_000, dea
     if (realRoot === null) return false
     const real = realOrNull(absolute)
     if (real === null) return false
-    if (samePath(real, realRoot)) return true
-    const prefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep
-    return samePath(real.slice(0, Math.min(real.length, prefix.length)), prefix)
+    return withinRoot(real, realRoot)
   }
   let visited = 0
   let truncated = false
@@ -349,6 +413,8 @@ export function resolveInside(root, candidate) {
 export function symlinkHazard(root, candidate) {
   const absolute = resolveInside(root, candidate)
   if (absolute === null) return 'outside the session directory'
+  const parents = ancestorHazard(root, absolute)
+  if (parents !== null) return parents
   if (!staysPut(absolute)) return 'a symbolic link or junction is in the way'
   let stat
   try {

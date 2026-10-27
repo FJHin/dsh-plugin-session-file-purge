@@ -389,5 +389,46 @@ check('the restored file is reported under a new name',
 check('the file already in place is untouched', fs.readFileSync(path.join(workspace, 'c.txt'), 'utf8') === 'newer')
 check('the trashed copy came back beside it', fs.readFileSync(path.join(workspace, 'c (restored).txt'), 'utf8') === 'c')
 
+console.log('\nrestore through a link is refused')
+// The narrow case left over after the overwrite fix: the file itself is gone, but a
+// directory above it has since become a junction. Resolving the leaf alone cannot
+// see that, so the restore has to refuse instead of writing into the link's target.
+fs.mkdirSync(path.join(workspace, 'nested'), { recursive: true })
+fs.writeFileSync(path.join(workspace, 'nested', 'deep.txt'), 'deep')
+const fourthPlan = await callRoute(routes, '/__sespurge/plan', { body: { sessionId } })
+check(
+  'the preview lists the nested file',
+  fourthPlan.payload.value.added.some((file) => file.path === 'nested/deep.txt'),
+  JSON.stringify(fourthPlan.payload.value.added.map((file) => file.path)),
+)
+const movedDeep = await callRoute(routes, '/__sespurge/purge', {
+  body: { sessionId, paths: ['nested/deep.txt'], planId: fourthPlan.payload.value.planId },
+})
+check('the nested file moves into the trash', movedDeep.payload.value.moved.length === 1, JSON.stringify(movedDeep.payload.value))
+check('the emptied folder is removed', !fs.existsSync(path.join(workspace, 'nested')))
+const restoreTarget = fs.mkdtempSync(path.join(os.tmpdir(), 'sespurge-restore-'))
+let nestedLink = false
+try {
+  fs.symlinkSync(restoreTarget, path.join(workspace, 'nested'), 'junction')
+  nestedLink = true
+} catch {
+  nestedLink = false
+}
+if (!nestedLink) {
+  console.log('  skip: this machine cannot create the junction the case needs')
+} else {
+  const refused = await callRoute(routes, '/__sespurge/trash/restore', { body: { id: movedDeep.payload.value.trashId } })
+  const refusedValue = refused.payload.value
+  check(
+    'a restore whose parent became a link is refused',
+    refusedValue.restored.length === 0 && refusedValue.failed.some((entry) => /refuses a restore/.test(entry.error)),
+    JSON.stringify(refusedValue),
+  )
+  check('nothing was written through the link', fs.readdirSync(restoreTarget).length === 0, fs.readdirSync(restoreTarget).join(','))
+  check('the trashed copy stays in the trash', refusedValue.remaining === 1, JSON.stringify(refusedValue))
+  fs.rmSync(path.join(workspace, 'nested'), { recursive: true, force: true })
+}
+fs.rmSync(restoreTarget, { recursive: true, force: true })
+
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) process.exitCode = 1

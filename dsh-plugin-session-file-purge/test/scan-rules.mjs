@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { captureBaseline, diffAgainstBaseline, ignoredEntry, normalizeKey, resolveInside, staysPut, symlinkHazard, walkFiles } from '../src/scan.js'
+import { captureBaseline, diffAgainstBaseline, ignoredEntry, normalizeKey, parentHazard, resolveInside, staysPut, symlinkHazard, walkFiles } from '../src/scan.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 void here
@@ -108,6 +108,9 @@ check('a path that does not exist yet stays put', staysPut(path.join(root, 'not-
 check('a plain file has no hazard', symlinkHazard(root, 'src/keep.txt') === null)
 check('a missing file has no hazard', symlinkHazard(root, 'gone.txt') === null)
 check('a path outside the root is refused by the hazard check', symlinkHazard(root, '../escape.txt') === 'outside the session directory')
+check('a real nested directory has no parent hazard', parentHazard(root, 'src/keep.txt') === null)
+check('a directory that does not exist yet is not a parent hazard', parentHazard(root, path.join('fresh', 'dir', 'report.txt')) === null)
+check('a path outside the root has a parent hazard', parentHazard(root, '../escape.txt') === 'outside the session directory')
 const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'sespurge-outside-'))
 fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret')
 // A junction is the only link Windows makes without developer mode; Node reports
@@ -139,6 +142,12 @@ if (linked === null) {
   })
   check('the walk reports the link instead of following it', reported.includes(linked), reported.join(','))
   check('nothing behind the link is walked', !used.some((entry) => entry.startsWith(`${linked}/`)) && !reported.some((entry) => entry.startsWith(`${linked}/`)), used.join(','))
+  // The narrow case: the file itself is gone, so only the parents can reveal the
+  // link. Resolving the leaf alone would say "fine" and the write would land on the
+  // link's target, outside the working directory.
+  check('a missing file behind the link has a parent hazard', parentHazard(root, path.join(linked, 'not-there-yet.txt')) === 'a symbolic link or junction is in the way')
+  check('the hazard check refuses that missing file too', symlinkHazard(root, path.join(linked, 'not-there-yet.txt')) === 'a symbolic link or junction is in the way')
+  check('a deeper missing path behind the link is refused', parentHazard(root, path.join(linked, 'deep', 'nested', 'x.txt')) === 'a symbolic link or junction is in the way')
   const withLink = await diffAgainstBaseline({ baseline, budgetMs: 5000 })
   check('the diff carries the links it saw', withLink.links.includes(linked), JSON.stringify(withLink.links))
 }

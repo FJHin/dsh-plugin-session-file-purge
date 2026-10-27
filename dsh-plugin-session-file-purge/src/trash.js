@@ -6,14 +6,17 @@
 // records the session's workspace root, which is what makes a restore possible
 // even after the session itself is gone.
 //
-// Two rules here are not negotiable. A link is never moved: the trash would then
-// hold a copy of whatever the link pointed at instead of the link. And a restore
-// never overwrites: when something already sits at the original path, the file
-// comes back under a free name beside it and the caller reports both names.
+// Three rules here are not negotiable. A link is never moved: the trash would then
+// hold a copy of whatever the link pointed at instead of the link. A restore never
+// overwrites: when something already sits at the original path, the file comes back
+// under a free name beside it and the caller reports both names. And neither
+// direction may reach through a link on the way — a parent directory that has since
+// become a link turns "restore my report" into "write into somebody else's folder",
+// so the ancestors are checked before every move and every restore.
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { symlinkHazard } from './scan.js'
+import { parentHazard, staysPut, symlinkHazard } from './scan.js'
 
 /** How many alternative names a restore may try before giving up. */
 const RESTORE_NAME_ATTEMPTS = 200
@@ -177,6 +180,11 @@ export function moveToTrash({ trashRoot, sessionId, root, files, directories = [
     const absolute = file.absolute
     const relative = file.relative
     const destination = path.join(payloadRoot, relative)
+    const parent = parentHazard(root, relative)
+    if (parent !== null) {
+      failed.push({ path: relative, error: parent })
+      continue
+    }
     let stat
     try {
       // lstat, not stat: what matters is the entry itself, never what it links to.
@@ -256,6 +264,8 @@ export function moveToTrash({ trashRoot, sessionId, root, files, directories = [
  * @returns the relative path it landed on, the absolute path, and whether it was renamed.
  */
 export function restoreFile(manifest, relative) {
+  // Covers the whole chain: an occupied leaf is fine (it is renamed beside), but a
+  // link anywhere above it is not — the copy would land on the link's target.
   const hazard = symlinkHazard(manifest.root, relative)
   if (hazard !== null) throw new Error(`the original location refuses a restore: ${hazard}`)
 
@@ -274,6 +284,11 @@ export function restoreFile(manifest, relative) {
     if (target === null) throw new Error('no free name is available beside the original path')
     try {
       fs.mkdirSync(path.dirname(target.absolute), { recursive: true })
+      // The directory may have been created *through* a link that appeared between
+      // the check above and this mkdir; only the resolved path can tell, so look again.
+      if (!staysPut(path.dirname(target.absolute))) {
+        throw new Error('the original location refuses a restore: a symbolic link or junction is in the way')
+      }
       // COPYFILE_EXCL turns a race with another writer into an error rather than
       // an overwrite: a restore must never replace a file the user already has.
       fs.copyFileSync(source, target.absolute, fs.constants.COPYFILE_EXCL)

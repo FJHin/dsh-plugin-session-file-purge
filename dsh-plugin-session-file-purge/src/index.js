@@ -36,7 +36,9 @@
 // own file list, /purge and /cleanup must quote it, and a path that was not in
 // that list is refused instead of moved. Links are reported by the scan and never
 // moved, never followed, and a restore never overwrites a file that is already
-// back at the original path — it comes back under a free name beside it.
+// back at the original path — it comes back under a free name beside it. Parents
+// count too: a directory that has since become a link would let a purge or a
+// restore reach outside the workspace, so every ancestor is resolved and checked.
 //
 // ESM module format (cordis bundle rule): named exports apply/inject/name.
 // Every registration rides the plugin fiber through ctx.effect / the injected
@@ -46,7 +48,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { diagnose } from './diagnostics.js'
-import { captureBaseline, diffAgainstBaseline, normalizeKey, resolveInside, symlinkHazard } from './scan.js'
+import { captureBaseline, diffAgainstBaseline, normalizeKey, parentHazard, resolveInside, symlinkHazard } from './scan.js'
 import { moveToTrash, restoreFile, dropTrashEntry, TrashIndex } from './trash.js'
 
 // Expand the { field: { type, required, description, items } } shorthand into a
@@ -606,6 +608,9 @@ function removeEmptiedDirectories(root, directories) {
   for (const relative of candidates) {
     const absolute = resolveInside(root, relative)
     if (absolute === null) continue
+    // The folder itself may be real while one of its parents has become a link, in
+    // which case "remove the now-empty folder" would be removing a folder elsewhere.
+    if (parentHazard(root, relative) !== null) continue
     try {
       // A link that happens to sit where a folder used to be is not that folder;
       // readdir would follow it and rmdir would fail (or, worse, look successful).
