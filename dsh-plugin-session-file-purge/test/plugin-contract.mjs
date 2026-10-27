@@ -30,12 +30,11 @@ function check(label, condition, detail) {
   }
 }
 
-// The loader imports the host half from the profile's node_modules; the stub
-// keeps this suite runnable outside a DSH installation.
+// The plugin converts its own tool parameters, so this suite needs no stub of the
+// optional @deepseek-ai/dsh-tools peer. Earlier runs wrote one into node_modules
+// and a directory install copied it into the profile; remove that leftover.
 const stubDir = path.join(here, '..', 'node_modules', '@deepseek-ai', 'dsh-tools')
-fs.mkdirSync(stubDir, { recursive: true })
-fs.writeFileSync(path.join(stubDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-tools', version: '0.0.0-stub', type: 'module', main: 'index.js' }))
-fs.writeFileSync(path.join(stubDir, 'index.js'), 'export const defineTool = (definition) => definition\n')
+fs.rmSync(stubDir, { recursive: true, force: true })
 
 const namespace = await import(`file://${pluginPath.replace(/\\/g, '/')}`)
 
@@ -44,6 +43,9 @@ check('exports apply', typeof namespace.apply === 'function')
 check('exports inject as a string array', Array.isArray(namespace.inject) && namespace.inject.every((entry) => typeof entry === 'string'), JSON.stringify(namespace.inject))
 check('exports optional as a string array', namespace.optional === undefined || (Array.isArray(namespace.optional) && namespace.optional.every((entry) => typeof entry === 'string')), JSON.stringify(namespace.optional))
 check('exports no default (the Loader takes the namespace as the plugin)', namespace.default === undefined, String(namespace.default))
+// The HTTP routes admit every request through the harness' connection service, so
+// it must be listed as optional: a composition without a Web UI still loads.
+check('declares the connection service as optional', (namespace.optional || []).includes('connection'), JSON.stringify(namespace.optional))
 check('does not set __esModule on the namespace', namespace.__esModule === undefined)
 
 console.log('\nloader config resolution')
@@ -68,6 +70,7 @@ check('the plugin declares no config schema (or a real one)', namespace.Config =
 
 console.log('\napply with a mock host')
 const routes = []
+const tools = []
 const context = {
   logger: { info() {}, warn() {} },
   get(name) {
@@ -76,6 +79,10 @@ const context = {
   },
   inject(services, callback) {
     if (services.includes('webServer')) callback({ webServer: context.get('webServer'), effect: (fn) => fn() })
+    if (services.includes('tools')) {
+      const toolsService = { register: (definition) => { tools.push(definition); return () => {} } }
+      callback({ tools: toolsService, effect: (fn) => fn() })
+    }
   },
   on() {},
   effect(fn) { fn() },
@@ -89,6 +96,15 @@ try {
 check('apply runs without throwing', applyError === null, applyError)
 check('apply registers the HTTP routes', routes.length >= 7, `got ${routes.length}`)
 check('the config bound was accepted', routes.length >= 7)
+
+console.log('\nmodel tool schema')
+const parameters = tools[0]?.parameters ?? {}
+const fields = Object.keys(parameters.properties ?? {})
+check('registers exactly one tool', tools.length === 1, `got ${tools.length}`)
+check('parameters are a JSON Schema object', parameters.type === 'object', String(parameters.type))
+check('properties are the three fields', fields.join(',') === 'sessionId,mode,paths', fields.join(','))
+check('required lists sessionId only', JSON.stringify(parameters.required) === '["sessionId"]', JSON.stringify(parameters.required))
+check('no shorthand "required" survives inside properties', fields.every((field) => !('required' in parameters.properties[field])))
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 if (failures > 0) process.exitCode = 1

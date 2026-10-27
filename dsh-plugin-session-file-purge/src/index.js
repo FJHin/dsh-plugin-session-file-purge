@@ -26,16 +26,53 @@
 //   list:    GET  /__sespurge/session/list
 //   tools:   session_files (plan or purge from inside a conversation)
 //
+// Every route is admitted through the harness' own connection service first — the
+// same Host/Origin fence and signed browser-session cookie that guard /api — so a
+// route that lists sessions or moves files answers only the Web UI session that
+// could already drive it, never another origin, another local app, or a bare
+// curl. See admissionStatus() below.
+//
 // ESM module format (cordis bundle rule): named exports apply/inject/name.
 // Every registration rides the plugin fiber through ctx.effect / the injected
 // context, so disposing the plugin removes its routes, listeners and tools.
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 import { diagnose } from './diagnostics.js'
 import { captureBaseline, diffAgainstBaseline, resolveInside } from './scan.js'
 import { moveToTrash, restoreFile, dropTrashEntry, TrashIndex } from './trash.js'
+
+// Expand the { field: { type, required, description, items } } shorthand into a
+// JSON Schema object; pass an already-valid schema through, and reject anything
+// else at load time instead of letting the provider fail every request later.
+function toJsonSchema(parameters) {
+  if (parameters === undefined || parameters === null) return undefined
+  if (typeof parameters !== 'object' || Array.isArray(parameters)) {
+    throw new TypeError('tool parameters must be an object')
+  }
+  const fields = Object.entries(parameters)
+  const shorthand = fields.every(([, spec]) => spec && typeof spec === 'object' && typeof spec.type === 'string')
+  if (!shorthand) {
+    if (parameters.type !== 'object') {
+      throw new TypeError('tool parameters must be a JSON Schema object with type: "object" and properties')
+    }
+    return parameters
+  }
+  const properties = {}
+  const required = []
+  for (const [field, spec] of fields) {
+    const { required: isRequired, ...rest } = spec
+    properties[field] = rest
+    if (isRequired === true) required.push(field)
+  }
+  return { type: 'object', properties, ...(required.length > 0 ? { required } : {}), additionalProperties: false }
+}
+
+// The registry receives whatever is registered here verbatim; keep the conversion
+// (and its validation) in this package rather than trusting an optional peer.
+function defineTool(definition) {
+  return { ...definition, parameters: toJsonSchema(definition.parameters) }
+}
 
 export const name = 'session-file-purge'
 
@@ -44,7 +81,7 @@ diagnose('module-load', `node ${process.version}`)
 // `tools` is optional so a composition without the tool registry still gets the
 // HTTP flow; webServer is optional so a terminal-only profile still loads.
 export const inject = []
-export const optional = ['tools', 'webServer']
+export const optional = ['tools', 'webServer', 'connection']
 
 const SESSION_ID_RE = /^(session-)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -565,6 +602,8 @@ function sendJson(res, status, payload) {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
   })
   res.end(body)
 }
@@ -580,6 +619,72 @@ function readBody(req) {
     req.on('error', reject)
     req.on('aborted', () => reject(new Error('aborted')))
   })
+}
+
+// --- http admission -----------------------------------------------------------
+
+// The service whose verdict decides whether a request may reach a route at all.
+// Read per request: the web server and the connection service activate in either
+// order, and a disposed plugin must stop answering instead of caching a yes.
+function connectionOf(ctx) {
+  try {
+    const service = ctx.get('connection')
+    return service && typeof service.admit === 'function' ? service : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Ask the harness whether this request may use the plugin's routes.
+ *
+ * `connection.admit` is the gate `/api` itself passes through: it rejects a
+ * foreign Host or Origin with 403, and a caller without the browser session with
+ * 401. That session is a launch-token-derived cookie, HttpOnly, SameSite=Strict,
+ * bound to this hostname and port and signed with a key the browser cannot
+ * mint — so answering 200 here means the request came from the Web UI this
+ * harness started, not from a page on another origin and not from a bare script.
+ * Without the service there is no authenticated browser surface at all, and the
+ * route fails closed rather than serving session titles and file moves to
+ * whoever can reach the loopback port.
+ *
+ * @param ctx - host context.
+ * @param req - the node request.
+ * @returns the rejection status (401/403/503), or 0 when the request is admitted.
+ */
+function admissionStatus(ctx, req) {
+  const connection = connectionOf(ctx)
+  if (connection === null) {
+    diagnose('http-admission-skipped', 'no connection service; refusing unauthenticated access')
+    return 503
+  }
+  let admission
+  try {
+    admission = connection.admit(req)
+  } catch (error) {
+    diagnose('http-admission-failed', String((error && error.message) || error))
+    return 403
+  }
+  if (admission !== null && typeof admission === 'object' && 'rejection' in admission) {
+    const status = Number(admission.rejection)
+    return status === 401 || status === 403 ? status : 403
+  }
+  return 0
+}
+
+const REJECTION_TEXT = {
+  401: 'unauthorized',
+  403: 'forbidden',
+  415: 'content-type must be application/json',
+  503: 'the connection service is unavailable, so this route refuses unauthenticated access',
+}
+
+// A mutation must not be reachable as a cross-site "simple request": requiring a
+// JSON content type means a form post, an <img> probe or a link prefetch cannot
+// reach one, even if the cookie policy above ever loosened.
+function isJsonRequest(req) {
+  const header = String((req.headers && req.headers['content-type']) || '').toLowerCase()
+  return header.startsWith('application/json')
 }
 
 function requireSessionId(value) {
@@ -693,6 +798,15 @@ export function apply(ctx, rawConfig) {
           handler: async (req, res) => {
             if (req.method !== method) {
               sendJson(res, 405, { error: 'method not allowed' })
+              return
+            }
+            const rejection = admissionStatus(ctx, req)
+            if (rejection !== 0) {
+              sendJson(res, rejection, { error: REJECTION_TEXT[rejection] || 'forbidden' })
+              return
+            }
+            if (method === 'POST' && !isJsonRequest(req)) {
+              sendJson(res, 415, { error: REJECTION_TEXT[415] })
               return
             }
             try {
@@ -864,6 +978,14 @@ export function apply(ctx, rawConfig) {
     ctx.effect(() => () => clearInterval(timer))
   }
 
+  // Tool definitions stay in the shorthand below, but the registry forwards the
+  // definition to the model provider verbatim: the @deepseek-ai/dsh-tools peer is
+  // optional, and an identity defineTool (a leftover test stub used to be copied
+  // into profile installs) forwarded the shorthand as-is — an object without
+  // "type", which the provider rejects with "schema must be a JSON Schema of
+  // type object" and which broke every request in every non-ptc preset. Owning
+  // the conversion here removes the dependency on that peer entirely.
+  //
   // The model tool: plan or purge the files of one session. Registered through a
   // deferred inject so a composition without the tool registry still loads.
   ctx.inject(['tools'], (sub) => {

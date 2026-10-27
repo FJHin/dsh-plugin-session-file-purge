@@ -295,7 +295,17 @@ window.__ModuleLoader__.load({
         // live while the Host side is missing. Say so instead of leaving a bare
         // status code in the dialog.
         const missingHost = response.status === 404 || response.status === 405
-        throw new Error(missingHost ? `${detail} — host plugin routes are missing; restart the app (a page reload is not enough)` : detail)
+        // 401/403 comes from the harness, not from this plugin: the window carries
+        // no browser session for the Host (the app restarted, the session expired,
+        // or the page was opened outside the launcher), and the Host answers only
+        // requests its own connection service admitted.
+        const refused = response.status === 401 || response.status === 403
+        const hint = missingHost
+          ? `${detail} — host plugin routes are missing; restart the app (a page reload is not enough)`
+          : refused
+            ? `${detail} — this window is not authenticated for the plugin routes; reopen the app window`
+            : detail
+        throw new Error(hint)
       }
       return data.value
     }

@@ -25,10 +25,31 @@ function check(label, condition, detail) {
 }
 
 /**
+ * The service every plugin route is admitted through. A real one is the harness'
+ * browser/API gate: it rejects a foreign Host or Origin with 403 and a caller
+ * without the signed browser-session cookie with 401. The fake below models those
+ * two verdicts plus the two shapes this plugin must survive — a service that
+ * throws and a composition that has no connection service at all.
+ */
+function makeConnection() {
+  const state = { mode: 'admit', seen: [] }
+  return {
+    state,
+    admit(request) {
+      state.seen.push(request)
+      if (state.mode === 'throw') throw new Error('the connection service is disposed')
+      if (state.mode === 'reject401') return { rejection: 401 }
+      if (state.mode === 'reject403') return { rejection: 403 }
+      return { peer: { principal: { kind: 'owner' } } }
+    },
+  }
+}
+
+/**
  * Build the fake host context: the services the plugin reads, an HTTP route
  * table, a tool registry, and event emitters that behave like cordis's.
  */
-function makeContext({ home, workspaceRoot }) {
+function makeContext({ home, workspaceRoot, connection = null }) {
   const routes = []
   const tools = []
   const listeners = new Map()
@@ -79,6 +100,7 @@ function makeContext({ home, workspaceRoot }) {
         }
       }
       if (service === 'webServer') return { register: (route) => { routes.push(route); return () => {} } }
+      if (service === 'connection') return connection
       if (service === 'workspaceRegistry') return { list: () => [{ dir: workspaceRoot, sessionIds: ['session-11111111-1111-1111-1111-111111111111'] }] }
       return undefined
     },
@@ -108,14 +130,18 @@ function makeContext({ home, workspaceRoot }) {
 }
 
 /** Invoke one registered route the way the web server would. */
-async function callRoute(routes, routePath, { method = 'POST', body = {} } = {}) {
+async function callRoute(routes, routePath, { method = 'POST', body = {}, headers = null } = {}) {
   const route = routes.find((entry) => entry.path === routePath)
   if (!route) throw new Error(`no route registered at ${routePath}`)
   const chunks = []
   const serialized = JSON.stringify(body)
   const req = {
     method,
-    headers: { 'content-length': String(Buffer.byteLength(serialized)) },
+    headers: {
+      'content-length': String(Buffer.byteLength(serialized)),
+      ...(method === 'POST' ? { 'content-type': 'application/json' } : {}),
+      ...(headers || {}),
+    },
     on(event, listener) {
       if (event === 'data') {
         if (serialized !== undefined) listener(serialized)
@@ -161,7 +187,8 @@ fs.writeFileSync(path.join(workspace, 'node_modules', 'ignored', 'package.json')
 
 const session = { id: sessionId, header: { cwd: workspace } }
 
-const { context, routes, tools } = makeContext({ home, workspaceRoot: workspace })
+const connection = makeConnection()
+const { context, routes, tools } = makeContext({ home, workspaceRoot: workspace, connection })
 const { apply } = await import(`file://${pluginPath.replace(/\\/g, '/')}`)
 // The import above resolves the real package name; re-import the stubbed copy by
 // path so this harness runs without a DSH installation.
@@ -260,6 +287,39 @@ const unknownEntry = await callRoute(routes, '/__sespurge/trash/restore', { body
 check('unknown trash entry refused', unknownEntry.status === 404)
 const escaping = await callRoute(routes, '/__sespurge/trash/restore', { body: { id: '../../etc' } })
 check('path-traversal trash id refused', escaping.status === 404)
+
+console.log('\nhttp admission')
+// Every route asks the harness' connection service before it runs: 401 without a
+// browser session, 403 from a foreign origin, 503 when the composition has no
+// connection service, and 415 for a mutation that does not declare JSON.
+const admitsBefore = connection.state.seen.length
+fs.writeFileSync(path.join(workspace, 'keep.txt'), 'keep')
+connection.state.mode = 'reject401'
+const unauthPing = await callRoute(routes, '/__sespurge/ping', { method: 'GET' })
+check('an unauthenticated ping is refused', unauthPing.status === 401, JSON.stringify(unauthPing))
+const unauthList = await callRoute(routes, '/__sespurge/session/list', { method: 'GET' })
+check('an unauthenticated session list is refused', unauthList.status === 401 && unauthList.payload.value === undefined, JSON.stringify(unauthList))
+const unauthPurge = await callRoute(routes, '/__sespurge/purge', { body: { sessionId, paths: ['keep.txt'] } })
+check('an unauthenticated purge is refused', unauthPurge.status === 401, JSON.stringify(unauthPurge))
+check('the refused purge moved nothing', fs.existsSync(path.join(workspace, 'keep.txt')))
+connection.state.mode = 'reject403'
+const foreign = await callRoute(routes, '/__sespurge/ping', { method: 'GET' })
+check('a foreign origin is refused', foreign.status === 403, JSON.stringify(foreign))
+connection.state.mode = 'throw'
+const disposed = await callRoute(routes, '/__sespurge/ping', { method: 'GET' })
+check('a failing connection service fails closed', disposed.status === 403, JSON.stringify(disposed))
+connection.state.mode = 'admit'
+check('every request reached the connection service first', connection.state.seen.length - admitsBefore === 5, `got ${connection.state.seen.length - admitsBefore}`)
+const plainText = await callRoute(routes, '/__sespurge/plan', { body: { sessionId }, headers: { 'content-type': 'text/plain' } })
+check('a non-JSON mutation is refused', plainText.status === 415, JSON.stringify(plainText))
+const admittedPing = await callRoute(routes, '/__sespurge/ping', { method: 'GET' })
+check('the admitted ping answers', admittedPing.status === 200 && admittedPing.payload.value.plugin === 'session-file-purge', JSON.stringify(admittedPing))
+
+const bare = makeContext({ home, workspaceRoot: workspace })
+apply(bare.context, { maxEntries: 5000, baselineBudgetMs: 5000, planBudgetMs: 5000 })
+check('a composition without a connection service still registers the routes', bare.routes.length === 8, `got ${bare.routes.length}`)
+const closedPing = await callRoute(bare.routes, '/__sespurge/ping', { method: 'GET' })
+check('without a connection service the route fails closed', closedPing.status === 503, JSON.stringify(closedPing))
 
 console.log('\nmodel tool')
 check('one tool registered', tools.length === 1, `got ${tools.length}`)

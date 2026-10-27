@@ -5,7 +5,6 @@
 
 - 📖 **写给人的介绍（中文，可分享）**：[介绍.md](介绍.md) — 为什么需要它、怎么工作、怎么用、有哪些限制
 - 📚 安装 / 接口 / 配置 / 排障：[中文说明](#中文说明) · [English](#english)
-- 🚀 上传/发布这份仓库：[发布到GitHub.md](发布到GitHub.md)（维护者备忘）
 
 ---
 
@@ -68,6 +67,8 @@ dsh plugin --profile <profile> add file:/path/to/dsh-plugin-session-file-purge
 
 本包不依赖任何运行时第三方库：宿主端只用 `node:fs`/`node:os`/`node:path`，客户端 bundle 通过宿主提供的模块表 `require('react')` 与 `@deepseek-ai/dsh-client-ui-primitives`。唯一的 peer 是 `@deepseek-ai/dsh-tools`，且标记为 optional——compositor 里没有工具注册表时插件仍会加载（只是不注册 agent 工具）。
 
+包清单同时声明了兼容范围：`engines.dsh: ">=0.2.0-rc.2 <0.3.0"`（本插件验证过的 DSH 版本区间，含 prerelease）与 `dsh.manifestVersion: 1`（清单格式）。DSH 当前的安装器与 loader 不强制这两项，所以它们是声明而不是护栏——升级到区间之外的大版本时，请先看「已知限制」里 `storageDomain` 表结构那条。
+
 与 [`@pepsi-ai/dsh-plugin-session-delete`](https://www.npmjs.com/package/@pepsi-ai/dsh-plugin-session-delete) 的关系：两者提供同一套界面（会话头部垃圾桶按钮 + 侧边栏「⋯」菜单项 + 风险确认弹窗），会话删除链路也走同一套 `storageDomain` 表。**同时启用会出现两个垃圾桶按钮、两层弹窗**，二选一即可。选择用本插件时，把另一个在自己的 profile patch 里关掉：
 
 ```yaml
@@ -104,6 +105,8 @@ dsh plugin --profile <profile> add file:/path/to/dsh-plugin-session-file-purge
 
 `sessionId` 必须是 `<uuid>` 或 `session-<uuid>`；`paths` 一律相对工作目录，服务端用 `resolveInside` 校验，`../` 之类的越界路径会被拒绝并计入响应里的 `failed`。
 
+**每条路由的第一步是准入检查**，而不是读参数：handler 调用 `ctx.get('connection').admit(req)`——就是 `/api` 自己走的那道闸。它先做 Host/Origin 栅栏（Host 必须是回环地址/监听地址/可信主机，Origin 必须同源，`sec-fetch-site: cross-site` 一律拒绝，失败 `403`），再校验浏览器会话（cookie 由进程启动 token 派生、HttpOnly、SameSite=Strict、绑定当前 hostname 与端口、用浏览器无法伪造的密钥签名，缺失或过期 `401`）。组合里没有 `connection` 服务时一律 `503`——**失败关闭，绝不放行**。POST 还必须声明 `content-type: application/json`，否则 `415`，这样跨站表单、`<img>` 探针连"简单请求"都凑不出来。结果：会话标题、文件移动、回收站内容只对"能驱动这个 Web UI 的那个窗口"可见。
+
 ### 配置
 
 profile 行的 `config` 支持这些字段（正整数，缺省用默认值）：
@@ -119,6 +122,7 @@ profile 行的 `config` 支持这些字段（正整数，缺省用默认值）�
 
 ### 安全设计
 
+- **身份与来源校验**：所有路由先过宿主的 `connection.admit(req)`（Host/Origin 栅栏 + 启动 token 派生的浏览器会话 cookie），未认证 `401`、跨源 `403`、无 `connection` 服务 `503`；POST 另要求 `application/json`。
 - **只快照、只对比，不改文件**：`plan` 完全只读；只有 `purge`/`cleanup` 才移动文件，且优先 `rename`（跨盘或被占用时退化为复制后删除）。
 - **越界拦截**：所有来自客户端或模型的路径都过 `resolveInside(root, path)`，解析后必须仍在会话工作目录内。
 - **不碰依赖和版本库**：`node_modules`、`.git`、`.hg`、`.venv`、`__pycache__`、`.next`、`.gradle` 等从不进入快照，也从不出现在清单里。
@@ -153,7 +157,8 @@ profile 行的 `config` 支持这些字段（正整数，缺省用默认值）�
 
 - 只有 `module-load`、没有 `apply` → 插件未被激活（见上一节「给插件作者的一个坑」）。
 - 有 `apply`、没有 `http-register` → webServer 服务时序问题；插件已用「直接取 / 延迟注入 / 轮询」三条路兜底。
-- `GET /__sespurge/ping` 返回插件名与 pid，一条命令判断宿主端是否活着。
+- `GET /__sespurge/ping` 返回插件名与 pid，一条命令判断宿主端是否活着。**用 `curl` 或未带浏览器会话的 `fetch` 打它会得到 `401`——这本身就证明路由已注册、准入闸门生效**（`503` 则是组合里没有 `connection` 服务）。
+- `node tools/verify-live.mjs` 同理：不指定 `--cookie` 时它会打印 `401` 并说明这是预期；把窗口当前使用的 cookie 传进去（`--cookie "<name>=<value>"`）才会走完只读检查。
 
 ### 开发
 
@@ -225,6 +230,8 @@ Restart the profile afterwards: a newly added bundle is resolved during composit
 
 No third-party runtime dependencies: the host half uses only `node:fs`/`node:os`/`node:path`, and the client bundle reaches the shared UI through the module table (`require('react')`, `require('@deepseek-ai/dsh-client-ui-primitives')`). The only peer, `@deepseek-ai/dsh-tools`, is optional, so a composition without the tool registry still loads the plugin.
 
+The manifest also declares its compatibility window: `engines.dsh: ">=0.2.0-rc.2 <0.3.0"` (the DSH versions this plugin was verified against, prereleases included) and `dsh.manifestVersion: 1` (manifest format). Neither is enforced by the current installer or loader — they are declarations. Before jumping to a major version outside that range, check the `storageDomain` note under *Known limitations*.
+
 ### HTTP API
 
 | Method | Path | Purpose |
@@ -240,6 +247,8 @@ No third-party runtime dependencies: the host half uses only `node:fs`/`node:os`
 
 Paths are always relative to the session's working directory and are re-validated with `resolveInside`; anything escaping the root is refused and reported in `failed`.
 
+**Admission comes before the parameters**: every handler first calls `ctx.get('connection').admit(req)`, the gate `/api` itself passes through — a Host/Origin fence (loopback, the bound address or a trusted host; same origin; `sec-fetch-site: cross-site` always refused → `403`) and then the browser session (a launch-token-derived cookie, HttpOnly, SameSite=Strict, bound to this hostname and port, signed with a key the browser cannot mint → `401` when missing or stale). With no `connection` service the route answers `503` and fails closed. A POST must also declare `content-type: application/json` (`415` otherwise), which removes the cross-site "simple request" path entirely. Net effect: session titles, file moves and trash contents are visible only to the window that can already drive this UI.
+
 ### Configuration
 
 | Field | Default | Meaning |
@@ -253,6 +262,7 @@ Paths are always relative to the session's working directory and are re-validate
 
 ### Safety
 
+- Every route is admitted by the harness' `connection.admit(req)` (Host/Origin fence plus the launch-token-derived browser cookie): `401` unauthenticated, `403` from a foreign origin, `503` when no `connection` service exists; POSTs must be `application/json`.
 - `plan` is read-only; only `purge`/`cleanup` move files, and they `rename` (falling back to copy-then-remove across devices).
 - Every client- or model-supplied path goes through `resolveInside(root, path)`.
 - `node_modules`, `.git` and build caches never enter a snapshot or a list.
@@ -275,7 +285,7 @@ Paths are always relative to the session's working directory and are re-validate
 
 ### Troubleshooting
 
-See `~/.dsh/session-file-purge/diagnostics.log` (one line per lifecycle step: `module-load`, `apply`, `http-register`, …) and `GET /__sespurge/ping`. `node tools/verify-live.mjs` walks the read-only routes against a running harness and prints sessions, baselines and trash batches; add `--plan <sessionId>` to inspect what a purge would move (still read-only).
+See `~/.dsh/session-file-purge/diagnostics.log` (one line per lifecycle step: `module-load`, `apply`, `http-register`, `http-admission-*`, …) and `GET /__sespurge/ping` — a `401` there from `curl` is the admission gate working, not a failure (`503` means the composition has no `connection` service). `node tools/verify-live.mjs` walks the read-only routes against a running harness and prints sessions, baselines and trash batches; add `--plan <sessionId>` to inspect what a purge would move (still read-only).
 
 ### License
 

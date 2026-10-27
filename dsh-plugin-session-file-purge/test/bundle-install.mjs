@@ -47,6 +47,14 @@ check('the bundle patch is listed in files (so npm pack ships it)', (manifest.fi
 check('the declared peer range accepts the current runtime line', /0\.\d+\.\d+/.test(manifest.peerDependencies?.['@deepseek-ai/dsh-tools'] || ''), manifest.peerDependencies?.['@deepseek-ai/dsh-tools'])
 check('the optional peer is declared optional', manifest.peerDependenciesMeta?.['@deepseek-ai/dsh-tools']?.optional === true)
 
+// The market and the loader both read this: `engines.dsh` is the version range the
+// author claims, `dsh.manifestVersion` the manifest format it is written in.
+check('the package declares a DSH compatibility range', typeof manifest.engines?.dsh === 'string' && manifest.engines.dsh.trim().length > 0, JSON.stringify(manifest.engines))
+check('the DSH range is a plain semver range', /^[\s]*[><=^~0-9vx*]/.test(manifest.engines?.dsh || '') && !/workspace:/.test(manifest.engines?.dsh || ''), manifest.engines?.dsh)
+check('the DSH range spans a release line, not one exact build', /[<>^~]/.test(manifest.engines?.dsh || ''), manifest.engines?.dsh)
+check('the package declares the manifest format', manifest.dsh?.manifestVersion === 1, String(manifest.dsh?.manifestVersion))
+check('the version is strict semver', /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(manifest.version || ''), manifest.version)
+
 console.log('\nbundle patch')
 const patchPath = path.join(packageDir, manifest.dsh.bundle.patch)
 check('the declared patch file exists', fs.existsSync(patchPath), patchPath)
@@ -133,10 +141,10 @@ for (const source of sources) {
     externalImports.add(specifier)
   }
 }
-const allowed = new Set(['node:fs', 'node:os', 'node:path', 'react', '@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-client-ui-primitives'])
+const allowed = new Set(['node:fs', 'node:os', 'node:path', 'react', '@deepseek-ai/dsh-client-ui-primitives'])
 const unexpected = [...externalImports].filter((specifier) => !allowed.has(specifier))
 check('no unexpected external import appears in the sources', unexpected.length === 0, unexpected.join(', '))
-check('the only host-side external import is the optional dsh-tools peer', [...externalImports].filter((s) => s.startsWith('@deepseek-ai/dsh-tools')).length === 1, [...externalImports].join(', '))
+check('the host half does not import the optional dsh-tools peer at runtime', [...externalImports].every((s) => !s.startsWith('@deepseek-ai/dsh-tools')), [...externalImports].join(', '))
 
 fs.rmSync(home, { recursive: true, force: true })
 
