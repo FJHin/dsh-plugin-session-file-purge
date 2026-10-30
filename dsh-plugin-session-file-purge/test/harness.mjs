@@ -283,6 +283,60 @@ const dropped = await callRoute(routes, '/__sespurge/trash/drop', { body: { id: 
 check('drop answers ok', dropped.payload.ok === true)
 const afterDrop = await callRoute(routes, '/__sespurge/trash', { method: 'GET' })
 check('the entry is gone from the index', !afterDrop.payload.value.entries.some((entry) => entry.id === secondId))
+console.log('\ndelete a selection for good')
+// A full cycle each: the session comes back (new baseline), writes the named
+// files, then the preview and the purge put them into one trash batch.
+async function purgeCycle(names, turn) {
+  fs.mkdirSync(path.join(home, 'sessions', '--tmp--', sessionId), { recursive: true })
+  fs.writeFileSync(path.join(home, 'sessions', '--tmp--', sessionId, 'session.v4.jsonl.zstd'), 'log')
+  context.emit('session/disposed', session)
+  context.emit('session/event', session, { type: 'turn/start', data: { turn } })
+  await new Promise((resolve) => setTimeout(resolve, 400))
+  for (const name of names) fs.writeFileSync(path.join(workspace, name), name)
+  const preview = await callRoute(routes, '/__sespurge/plan', { body: { sessionId } })
+  const done = await callRoute(routes, '/__sespurge/purge', {
+    body: { sessionId, paths: names, planId: preview.payload.value.planId },
+  })
+  return done.payload.value
+}
+const one = await purgeCycle(['one.txt'], 3)
+const two = await purgeCycle(['two.txt'], 4)
+const three = await purgeCycle(['three.txt'], 5)
+const listedBatches = await callRoute(routes, '/__sespurge/trash', { method: 'GET' })
+const listedIds = listedBatches.payload.value.entries.map((entry) => entry.id)
+check('the three fresh batches are listed', [one, two, three].every((batch) => listedIds.includes(batch.trashId)), JSON.stringify(listedIds))
+
+// A selection is the panel's checkbox list: whatever it names goes, and a name
+// that is already gone is reported back instead of failing the whole request.
+const partialSelection = await callRoute(routes, '/__sespurge/trash/drop', { body: { ids: [one.trashId, 'nope'] } })
+check('a selection answers ok', partialSelection.status === 200 && partialSelection.payload.ok === true, JSON.stringify(partialSelection.payload))
+check('the listed batch is dropped', partialSelection.payload.value.dropped.includes(one.trashId))
+check('the missing batch is reported, not fatal', partialSelection.payload.value.failed.some((row) => row.id === 'nope'))
+check('the dropped batch left the disk', !fs.existsSync(one.trashDir))
+check('the other batches are untouched', fs.existsSync(two.trashDir) && fs.existsSync(three.trashDir))
+
+// Ids are the only handle, and they are still checked by the index: a separator
+// can never point the delete outside the trash root.
+const traversal = await callRoute(routes, '/__sespurge/trash/drop', { body: { ids: ['../../etc', two.trashId] } })
+check('a path-traversal id is refused inside a selection', traversal.payload.value.failed.some((row) => row.id === '../../etc'))
+check('the real id in the same selection still drops', traversal.payload.value.dropped.includes(two.trashId))
+check('the trash root itself survived', fs.existsSync(path.join(home, 'session-file-purge', 'trash')))
+
+const noSelector = await callRoute(routes, '/__sespurge/trash/drop', { body: {} })
+check('drop without a batch named is refused', noSelector.status === 400, JSON.stringify(noSelector))
+const singleMiss = await callRoute(routes, '/__sespurge/trash/drop', { body: { id: 'nope' } })
+check('a single unknown batch is still a 404', singleMiss.status === 404)
+
+// The explicit "empty the trash" switch: every batch the index still lists.
+const emptied = await callRoute(routes, '/__sespurge/trash/drop', { body: { all: true } })
+check('all: true drops the rest', emptied.status === 200 && emptied.payload.value.dropped.includes(three.trashId), JSON.stringify(emptied.payload))
+check('nothing is left to drop', emptied.payload.value.remaining === 0)
+const afterEmpty = await callRoute(routes, '/__sespurge/trash', { method: 'GET' })
+check('the index is empty', afterEmpty.payload.value.entries.length === 0)
+check('the last batch left the disk', !fs.existsSync(three.trashDir))
+const stillAll = await callRoute(routes, '/__sespurge/trash/drop', { body: { all: true } })
+check('emptying an empty trash is a no-op', stillAll.status === 200 && stillAll.payload.value.dropped.length === 0)
+
 
 console.log('\nvalidation')
 const bad = await callRoute(routes, '/__sespurge/plan', { body: { sessionId: 'not-a-session' } })

@@ -23,6 +23,7 @@
 //   purge:   POST /__sespurge/purge    — trash the selection, keep the session
 //   trash:   GET  /__sespurge/trash    — what is in the trash
 //   restore: POST /__sespurge/trash/restore
+//   drop:    POST /__sespurge/trash/drop  — one batch, a selection, or all of it
 //   list:    GET  /__sespurge/session/list
 //   tools:   session_files (plan or purge from inside a conversation)
 //
@@ -1020,12 +1021,51 @@ export function apply(ctx, rawConfig) {
     })
 
     route('POST', '/__sespurge/trash/drop', async (args) => {
-      const id = String(args.id || '')
-      const manifest = index.manifest(id)
-      if (manifest === null) throw new PurgeError('that trash entry no longer exists', 404)
-      dropTrashEntry(manifest)
-      index.remove(id)
-      return { dropped: id }
+      // Three shapes, one rule: a batch only goes for good when the caller names
+      // it. `id` is the row button, `ids` is the panel's selection — it sends the
+      // batches it actually listed, so a stale panel cannot take out a newer one —
+      // and `all: true` is the explicit "empty the trash" switch.
+      const named = Array.isArray(args.ids) ? args.ids : []
+      const wanted = args.all === true
+        ? index.entries.map((entry) => entry.id)
+        : named.length > 0
+          ? named.map((value) => String(value ?? ''))
+          : typeof args.id === 'string' && args.id !== ''
+            ? [args.id]
+            : []
+      if (wanted.length === 0) {
+        if (args.all === true) return { dropped: [], failed: [], remaining: index.entries.length }
+        throw new PurgeError('drop needs an entry id, a list of ids, or all: true', 400)
+      }
+      const dropped = []
+      const failed = []
+      const seen = new Set()
+      for (const raw of wanted) {
+        const id = String(raw)
+        if (seen.has(id)) continue
+        seen.add(id)
+        // manifest() refuses separators and "..", so an id from a caller can only
+        // ever name a directory directly under the trash root.
+        const manifest = index.manifest(id)
+        if (manifest === null) {
+          failed.push({ id, error: 'that trash entry no longer exists' })
+          continue
+        }
+        try {
+          dropTrashEntry(manifest)
+          index.remove(id)
+          dropped.push(id)
+        } catch (error) {
+          failed.push({ id, error: String((error && error.message) || error) })
+        }
+      }
+      // One named batch that is not there is still a 404, exactly as before the
+      // bulk shape existed: a single miss is an error, a partial selection is a
+      // report the panel can show.
+      if (wanted.length === 1 && dropped.length === 0 && failed.length === 1) {
+        throw new PurgeError('that trash entry no longer exists', 404)
+      }
+      return { dropped, failed, remaining: index.entries.length }
     })
   }
 

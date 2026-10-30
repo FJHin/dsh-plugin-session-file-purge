@@ -50,7 +50,7 @@ DSH 与大多数 harness 一样，**没有「会话 ↔ 文件」的台账**：�
 - **基线快照**：会话第一个回合开始时（`turn/start`，任何工具执行之前）记录工作目录中每个文件的 `路径 → 大小/修改时间`，存到 `~/.dsh/session-file-purge/baselines/<sessionId>.json`。
 - **可勾选清单**：删除会话时列出「新建」和「改动」两组文件；新建默认勾选，「改动」默认不勾选（这类文件在会话开始前就存在，整文件移走风险更大）。两组各自有全选/全不选，显示单文件大小与合计。
 - **先回收站、后删除**：选中文件按原相对路径移入 `~/.dsh/session-file-purge/trash/<时间戳>-<会话短id>/files/` 并写入 `manifest.json`；随后才删除会话日志、投影缓存、工作区记账。被移空的文件夹一并删掉，仍非空的目录不动。
-- **可撤销**：结束页有「撤销：把文件放回去」；侧边栏行菜单与弹窗里都能打开「文件回收站」，逐批放回或永久删除。
+- **可撤销**：结束页有「撤销：把文件放回去」；侧边栏行菜单与弹窗里都能打开「文件回收站」，逐批放回，或勾选（含一键全选）后一次性永久删除。
 - **只清文件不删会话**：侧边栏行菜单的「清理本会话产生的文件…」只做回收站这一步。
 - **Agent 工具** `session_files`：`mode: "list"` 列出某会话产生/改动的文件，`mode: "purge"` 按 `paths` 移入回收站。
 
@@ -86,7 +86,7 @@ dsh plugin --profile <profile> add file:/path/to/dsh-plugin-session-file-purge
 | 会话头部垃圾桶按钮 | 打开删除流程：确认会话 → 文件清单 → 移入回收站并删会话 |
 | 侧边栏会话行「⋯」菜单 → 删除会话（含产生的文件）… | 同上，不需要切换会话 |
 | 侧边栏会话行「⋯」菜单 → 清理本会话产生的文件… | 直接进入文件清单，**只移文件、保留会话** |
-| 侧边栏会话行「⋯」菜单 → 打开文件回收站… | 回收站面板：逐批放回 / 永久删除 |
+| 侧边栏会话行「⋯」菜单 → 打开文件回收站… | 回收站面板：逐批放回；勾选或全选后一次性永久删除 |
 | 弹窗结束页 | 撤销（把本批文件放回原处）、打开回收站 |
 
 侧边栏的「⋯」菜单在客户端是硬编码的，没有扩展槽，所以这三个菜单项是注入 DOM 实现的；头部按钮走 `conversation.session.header.actions` 槽、弹窗与回收站面板走 `shell.overlay` 槽。
@@ -102,7 +102,7 @@ dsh plugin --profile <profile> add file:/path/to/dsh-plugin-session-file-purge
 | POST | `/__sespurge/cleanup` | `{sessionId, paths[], planId, deleteSession}` → 移入回收站（可选）并删除会话 |
 | GET | `/__sespurge/trash` | 回收站批次列表 |
 | POST | `/__sespurge/trash/restore` | `{id, paths?}` → 放回指定文件或整批 |
-| POST | `/__sespurge/trash/drop` | `{id}` → 永久删除某一批 |
+| POST | `/__sespurge/trash/drop` | `{id}` 或 `{ids: []}` 或 `{all: true}` → 永久删除一批 / 选中的多批 / 全部 |
 
 `sessionId` 必须是 `<uuid>` 或 `session-<uuid>`；`paths` 一律相对工作目录，服务端用 `resolveInside` 校验，`../` 之类的越界路径会被拒绝并计入响应里的 `failed`。
 
@@ -225,7 +225,7 @@ The transcript does carry `write`/`edit`/`present` arguments, so paths could be 
 - **Baseline snapshot** on the session's first `turn/start`, before any tool runs: `path → size/mtime` for the whole working directory, stored under `~/.dsh/session-file-purge/baselines/<sessionId>.json`.
 - **Checkbox list** at deletion time, split into *created* (checked by default) and *changed* (unchecked — those existed before the session, so moving them whole is riskier), with per-group select-all and per-file sizes.
 - **Trash first, delete second**: checked files move to `~/.dsh/session-file-purge/trash/<timestamp>-<short id>/files/` preserving their relative paths, with a `manifest.json`; the session log, projection cache and workspace accounting are removed only afterwards. Folders the purge emptied are removed; folders that still hold files are left alone.
-- **Undo**: the final step restores the batch; a trash panel in the sidebar lists every batch with restore and delete-for-good.
+- **Undo**: the final step restores the batch; a trash panel in the sidebar lists every batch with restore and delete-for-good, and its checkboxes (plus select-all) delete a whole selection in one confirmed step.
 - **Files only**: a sidebar item purges a session's files while keeping the session.
 - **Agent tool** `session_files`: `mode: "list"` or `mode: "purge"` with explicit `paths`.
 
@@ -256,7 +256,7 @@ The manifest also declares its compatibility window: `engines.dsh: ">=0.2.0-rc.2
 | POST | `/__sespurge/cleanup` | `{sessionId, paths[], planId, deleteSession}` → trash, then delete |
 | GET | `/__sespurge/trash` | trash batches |
 | POST | `/__sespurge/trash/restore` | `{id, paths?}` → restore one file or a whole batch |
-| POST | `/__sespurge/trash/drop` | `{id}` → delete a batch for good |
+| POST | `/__sespurge/trash/drop` | `{id}`, `{ids: []}` or `{all: true}` → delete one batch, the checked ones, or all of them |
 
 Paths are always relative to the session's working directory and are re-validated with `resolveInside`; anything escaping the root is refused and reported in `failed`.
 

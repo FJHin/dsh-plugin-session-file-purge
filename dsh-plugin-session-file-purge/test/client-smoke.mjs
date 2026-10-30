@@ -1,4 +1,4 @@
-﻿// Client-bundle smoke test: loads src/client.js with a stubbed module table and
+// Client-bundle smoke test: loads src/client.js with a stubbed module table and
 // a minimal React, then drives the dialog through intro -> scan -> files -> done
 // and the trash panel against a fake fetch. It catches bundle-level mistakes
 // (bad require ids, undefined exports, render-time crashes, stale closures)
@@ -198,7 +198,12 @@ globalThis.fetch = async (url, options) => {
   if (url === '/__sespurge/trash') {
     return { ok: true, status: 200, json: async () => ({ ok: true, value: { trashRoot: 'C:/home/.dsh/session-file-purge/trash', entries: [
       { id: '20260101-000000-11111111', sessionId: 'session-1', at: '2026-01-01T00:00:00.000Z', root: 'D:/work/demo', fileCount: 1, bytes: 2048, dir: 'x', missing: false },
+      { id: '20260101-000000-22222222', sessionId: 'session-2', at: '2026-01-02T00:00:00.000Z', root: 'D:/work/other', fileCount: 2, bytes: 1024, dir: 'y', missing: false },
     ] } }) }
+  }
+  if (url === '/__sespurge/trash/drop') {
+    const wanted = JSON.parse((options && options.body) || '{}').ids || []
+    return { ok: true, status: 200, json: async () => ({ ok: true, value: { dropped: wanted, failed: [], remaining: 0 } }) }
   }
   if (url === '/__sespurge/trash/restore') {
     return { ok: true, status: 200, json: async () => ({ ok: true, value: { restored: ['report.docx'], renamed: [], failed: [], remaining: 0 } }) }
@@ -406,6 +411,33 @@ check('trash panel renders its dialog', openPanel.nodes.some((node) => node.prop
 check('trash panel read the host', requests.some((request) => request.url === '/__sespurge/trash'))
 check('trash panel shows the trash root', JSON.stringify(openPanel.element).includes('session-file-purge/trash'))
 check('trash panel lists the trashed batch', JSON.stringify(openPanel.element).includes('20260101-000000-11111111'))
+
+// --- select all, delete for good ---------------------------------------------
+
+check('the panel offers a checkbox per batch', openPanel.nodes.filter((node) => node.props && node.props.type === 'checkbox' && node.props['aria-label'] === 'trash.select').length === 2)
+const selectAll = openPanel.nodes.find((node) => node.props && node.props.type === 'checkbox' && node.props['aria-label'] === 'trash.selectAll')
+check('the panel offers a select-all checkbox', selectAll !== undefined)
+check('select all starts unticked', selectAll.props.checked === false)
+const dropSelectedButton = openPanel.nodes.find((node) => node.props && node.props['aria-label'] === 'trash.dropSelected')
+check('the panel offers one delete-selected button', dropSelectedButton !== undefined && dropSelectedButton.props.disabled === true)
+
+// An empty selection is a no-op: the button is inert and nothing is posted.
+const dropsBefore = requests.filter((request) => request.url === '/__sespurge/trash/drop').length
+await dropSelectedButton.props.onClick()
+check('an empty selection deletes nothing', requests.filter((request) => request.url === '/__sespurge/trash/drop').length === dropsBefore)
+
+// One tick takes the whole list, and one button sends the ids on screen.
+selectAll.props.onChange()
+const ticked = render(trash.component)
+const tickedBoxes = ticked.nodes.filter((node) => node.props && node.props.type === 'checkbox' && node.props['aria-label'] === 'trash.select')
+check('select all ticks every batch', tickedBoxes.length === 2 && tickedBoxes.every((node) => node.props.checked === true), JSON.stringify(tickedBoxes.map((node) => node.props.checked)))
+const armedButton = ticked.nodes.find((node) => node.props && node.props['aria-label'] === 'trash.dropSelected')
+check('the delete-selected button is armed', armedButton.props.disabled === false)
+await armedButton.props.onClick()
+const bulk = requests.filter((request) => request.url === '/__sespurge/trash/drop').pop()
+check('the whole selection goes out as one request', bulk !== undefined && bulk.body.ids.length === 2, JSON.stringify(bulk))
+check('that request names the batches on screen', bulk.body.ids.includes('20260101-000000-11111111') && bulk.body.ids.includes('20260101-000000-22222222'), JSON.stringify(bulk && bulk.body))
+
 
 // --- sidebar injection is at least wired -------------------------------------
 

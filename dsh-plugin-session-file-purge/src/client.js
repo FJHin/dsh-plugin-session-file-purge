@@ -98,6 +98,13 @@ window.__ModuleLoader__.load({
       'trash.restore': '放回',
       'trash.drop': '永久删除',
       'trash.dropConfirm': '永久删除这一批文件？此操作不可撤销。',
+      'trash.select': '选择这一批',
+      'trash.selectAll': '全选',
+      'trash.selectedCount': '已选 {n} 个批次',
+      'trash.dropSelected': '永久删除选中',
+      'trash.dropSelectedConfirm': '永久删除选中的 {n} 个批次？此操作不可撤销。',
+      'trash.droppedMany': '已永久删除 {n} 个批次。',
+      'trash.dropNothing': '先勾选要删除的批次。',
       'trash.missing': '（清单缺失）',
       'trash.loading': '正在读取…',
       'trash.close': '关闭',
@@ -159,6 +166,13 @@ window.__ModuleLoader__.load({
       'trash.restore': 'Restore',
       'trash.drop': 'Delete for good',
       'trash.dropConfirm': 'Delete this batch for good? This cannot be undone.',
+      'trash.select': 'Select this batch',
+      'trash.selectAll': 'Select all',
+      'trash.selectedCount': '{n} selected',
+      'trash.dropSelected': 'Delete selected for good',
+      'trash.dropSelectedConfirm': 'Delete the {n} selected batches for good? This cannot be undone.',
+      'trash.droppedMany': 'Deleted {n} batches for good.',
+      'trash.dropNothing': 'Check the batches to delete first.',
       'trash.missing': '(manifest missing)',
       'trash.loading': 'Loading…',
       'trash.close': 'Close',
@@ -724,6 +738,11 @@ window.__ModuleLoader__.load({
       useLocaleRevision()
       const [open, setOpen] = useState(false)
       const [state, setState] = useState({ loading: false, entries: [], trashRoot: null, error: null })
+      // Checked batches, kept as a plain array of ids: a reload re-checks the list
+      // and drops whatever the host no longer reports, so a stale checkbox can
+      // never name a batch that is already gone.
+      const [selected, setSelected] = useState([])
+      const [notice, setNotice] = useState(null)
 
       const load = useCallback(async () => {
         setState({ loading: true, entries: [], trashRoot: null, error: null })
@@ -731,9 +750,13 @@ window.__ModuleLoader__.load({
           const response = await fetch('/__sespurge/trash')
           const data = await response.json()
           if (!data.ok) throw new Error(data.error || 'failed')
-          setState({ loading: false, entries: data.value.entries || [], trashRoot: data.value.trashRoot, error: null })
+          const entries = data.value.entries || []
+          setState({ loading: false, entries, trashRoot: data.value.trashRoot, error: null })
+          const listed = new Set(entries.map((entry) => entry.id))
+          setSelected((current) => current.filter((id) => listed.has(id)))
         } catch (reason) {
           setState({ loading: false, entries: [], trashRoot: null, error: String((reason && reason.message) || reason) })
+          setSelected([])
         }
       }, [])
 
@@ -758,18 +781,76 @@ window.__ModuleLoader__.load({
         await load()
       }, [load])
 
-      const drop = useCallback(async (id) => {
-        if (typeof window.confirm === 'function' && !window.confirm(t('trash.dropConfirm'))) return
+      const toggle = useCallback((id) => {
+        setSelected((current) => (current.includes(id) ? current.filter((value) => value !== id) : [...current, id]))
+      }, [])
+
+      // One deleter for the row button, the selection and "all of it": the ids are
+      // always explicit, so the panel can only ever drop batches it just listed.
+      const dropMany = useCallback(async (ids, confirmKey) => {
+        const wanted = (Array.isArray(ids) ? ids : [ids]).filter((id) => typeof id === 'string' && id !== '')
+        if (wanted.length === 0) {
+          setNotice(t('trash.dropNothing'))
+          return
+        }
+        if (typeof window.confirm === 'function' && !window.confirm(t(confirmKey, { n: wanted.length }))) return
+        setNotice(null)
         try {
-          await postJson('/__sespurge/trash/drop', { id })
+          const result = await postJson('/__sespurge/trash/drop', { ids: wanted })
+          const gone = result && Array.isArray(result.dropped) ? result.dropped : wanted
+          const missed = result && Array.isArray(result.failed) ? result.failed : []
+          setSelected((current) => current.filter((id) => !gone.includes(id)))
+          if (missed.length > 0) {
+            setState((current) => ({
+              ...current,
+              error: missed.map((row) => `${row.id}: ${row.error}`).join('; '),
+            }))
+          } else {
+            setNotice(t('trash.droppedMany', { n: gone.length }))
+          }
         } catch (reason) {
           setState((current) => ({ ...current, error: String((reason && reason.message) || reason) }))
         }
         await load()
       }, [load, t])
 
+      const drop = useCallback((id) => dropMany([id], 'trash.dropConfirm'), [dropMany])
+
+      const toggleAll = useCallback(() => {
+        const ids = (state.entries || []).map((entry) => entry.id)
+        setSelected((current) => (ids.length > 0 && current.length === ids.length ? [] : ids))
+      }, [state.entries])
+
+      const dropSelected = useCallback(() => dropMany(selected, 'trash.dropSelectedConfirm'), [dropMany, selected])
+
       if (!open) return null
 
+      const allSelected = state.entries.length > 0 && selected.length === state.entries.length
+      // The select-all row sits above the batches: tick it, then one button takes
+      // the whole selection out for good (the empty trash case has no toolbar).
+      const toolbar = state.entries.length > 0
+        ? React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+          React.createElement('label', { style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' } },
+            React.createElement('input', {
+              type: 'checkbox',
+              checked: allSelected,
+              'aria-label': t('trash.selectAll'),
+              onChange: toggleAll,
+            }),
+            t('trash.selectAll')),
+          React.createElement('span', { style: metaStyle }, t('trash.selectedCount', { n: selected.length })),
+          React.createElement('button', {
+            type: 'button',
+            'aria-label': t('trash.dropSelected'),
+            disabled: selected.length === 0,
+            onClick: dropSelected,
+            style: {
+              ...ghostBtnStyle,
+              color: 'var(--dsw-alias-state-error-primary, #e5484d)',
+              ...(selected.length === 0 ? { opacity: 0.5, cursor: 'default' } : {}),
+            },
+          }, t('trash.dropSelected')))
+        : null
       const rows = (state.entries || []).map((entry) =>
         React.createElement('div', {
           key: entry.id,
@@ -783,6 +864,12 @@ window.__ModuleLoader__.load({
           },
         },
         React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 } },
+          React.createElement('input', {
+            type: 'checkbox',
+            checked: selected.includes(entry.id),
+            'aria-label': t('trash.select'),
+            onChange: () => toggle(entry.id),
+          }),
           React.createElement('strong', { style: { flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
             entry.sessionId || entry.id),
           React.createElement('span', { style: metaStyle }, t('trash.entryCount', { n: entry.fileCount })),
@@ -843,6 +930,8 @@ window.__ModuleLoader__.load({
       React.createElement('div', { style: metaStyle }, t('trash.desc')),
       state.trashRoot ? React.createElement('div', { style: metaStyle }, t('trash.root'), state.trashRoot) : null,
       state.error ? React.createElement('div', { role: 'alert', style: errStyle }, state.error) : null,
+      notice ? React.createElement('div', { role: 'status', style: metaStyle }, notice) : null,
+      toolbar,
       state.loading
         ? React.createElement('div', { style: metaStyle }, t('trash.loading'))
         : rows.length > 0
