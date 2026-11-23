@@ -337,6 +337,28 @@ check('the last batch left the disk', !fs.existsSync(three.trashDir))
 const stillAll = await callRoute(routes, '/__sespurge/trash/drop', { body: { all: true } })
 check('emptying an empty trash is a no-op', stillAll.status === 200 && stillAll.payload.value.dropped.length === 0)
 
+console.log('\na read-only file does not block a drop')
+// A purge keeps the file's attributes, and Windows refuses to unlink a read-only
+// file while blaming the directory it sits in. One such file used to abort the
+// whole batch, keep its index row, and make the same entry fail for ever.
+const readOnly = await purgeCycle(['readonly.txt'], 6)
+fs.chmodSync(path.join(readOnly.trashDir, 'files', 'readonly.txt'), 0o444)
+const readOnlyDrop = await callRoute(routes, '/__sespurge/trash/drop', { body: { id: readOnly.trashId } })
+check('a read-only file does not block the drop', readOnlyDrop.payload.ok === true && readOnlyDrop.payload.value.dropped.includes(readOnly.trashId), JSON.stringify(readOnlyDrop.payload))
+check('the read-only batch left the disk', !fs.existsSync(readOnly.trashDir))
+const afterReadOnly = await callRoute(routes, '/__sespurge/trash', { method: 'GET' })
+check('its index row is gone too', !afterReadOnly.payload.value.entries.some((entry) => entry.id === readOnly.trashId))
+
+console.log('\na batch whose directory already vanished leaves the index')
+// A manifest records an absolute path. When the harness home moved, the directory
+// stayed behind and the row points at nothing: dropping it must forget it.
+const ghost = await purgeCycle(['ghost.txt'], 7)
+fs.rmSync(ghost.trashDir, { recursive: true, force: true })
+const ghostDrop = await callRoute(routes, '/__sespurge/trash/drop', { body: { id: ghost.trashId } })
+check('a vanished batch is refused as missing', ghostDrop.status === 404, JSON.stringify(ghostDrop.payload))
+const afterGhost = await callRoute(routes, '/__sespurge/trash', { method: 'GET' })
+check('the stale row is gone', !afterGhost.payload.value.entries.some((entry) => entry.id === ghost.trashId))
+
 
 console.log('\nvalidation')
 const bad = await callRoute(routes, '/__sespurge/plan', { body: { sessionId: 'not-a-session' } })

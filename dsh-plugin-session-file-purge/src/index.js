@@ -1048,6 +1048,9 @@ export function apply(ctx, rawConfig) {
         // ever name a directory directly under the trash root.
         const manifest = index.manifest(id)
         if (manifest === null) {
+          // No manifest on disk: the row is all that is left, and no button can do
+          // anything with it, so forgetting it is the only useful outcome.
+          index.remove(id)
           failed.push({ id, error: 'that trash entry no longer exists' })
           continue
         }
@@ -1056,6 +1059,11 @@ export function apply(ctx, rawConfig) {
           index.remove(id)
           dropped.push(id)
         } catch (error) {
+          // A batch can be half deleted before the failure: a read-only file used to
+          // stop the recursive delete and leave both the files and this row behind,
+          // and nothing in the panel could ever clear that row again. An entry whose
+          // directory no longer exists is stale whatever the error says.
+          if (!fs.existsSync(manifest.dir)) index.remove(id)
           failed.push({ id, error: String((error && error.message) || error) })
         }
       }

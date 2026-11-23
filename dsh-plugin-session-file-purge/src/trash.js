@@ -315,6 +315,66 @@ export function restoreFile(manifest, relative) {
  * Remove a trash entry from disk for good.
  * @param manifest - the manifest of the trash entry.
  */
+/**
+ * Clear the read-only bit on the way down. Windows refuses to unlink a read-only
+ * file and reports the failure against the directory that holds it, so one such
+ * file (a downloaded image, an exported document) could stop a whole batch: the
+ * delete aborted, the index row stayed, and the same entry kept failing for ever.
+ * @param target - a file or directory inside a trash entry.
+ */
+function clearReadonly(target) {
+  let stat
+  try {
+    stat = fs.lstatSync(target)
+  } catch {
+    return
+  }
+  if (stat.isSymbolicLink()) return
+  if (!stat.isDirectory()) {
+    try {
+      fs.chmodSync(target, 0o666)
+    } catch {
+      /* the unlink that follows is the real attempt */
+    }
+    return
+  }
+  let names = []
+  try {
+    names = fs.readdirSync(target)
+  } catch {
+    return
+  }
+  for (const name of names) clearReadonly(path.join(target, name))
+  try {
+    fs.chmodSync(target, 0o777)
+  } catch {
+    /* best effort */
+  }
+}
+
+/**
+ * Remove a trash entry from disk for good.
+ * @param manifest - the manifest of the trash entry.
+ * @returns `removed: false` when the recorded directory is already gone (an
+ *   absolute path from a harness home that has since moved): the caller must
+ *   treat that as a finished delete, not as a reason to keep the index row.
+ */
 export function dropTrashEntry(manifest) {
-  fs.rmSync(manifest.dir, { recursive: true, force: true })
+  const target = manifest && typeof manifest.dir === 'string' ? manifest.dir : ''
+  if (target === '') return { removed: false, reason: 'no directory recorded' }
+  let stat
+  try {
+    stat = fs.lstatSync(target)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { removed: false, reason: 'missing' }
+    throw error
+  }
+  if (stat.isSymbolicLink()) {
+    fs.rmSync(target, { force: true })
+    return { removed: true }
+  }
+  if (!stat.isDirectory()) throw new Error('the trash entry is not a directory')
+  clearReadonly(target)
+  fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 120 })
+  return { removed: true }
 }
